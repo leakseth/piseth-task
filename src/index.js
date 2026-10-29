@@ -1,6 +1,7 @@
 import { Telegraf } from 'telegraf';
 import dotenv from 'dotenv';
 import dns from 'dns';
+import http from 'http';
 import {
   initDb,
   createTask,
@@ -630,7 +631,30 @@ async function launchBotWithRetry(targetBot, retries = 5, delayMs = 3000) {
   }
 }
 
-// Bootstrap application: connect DB, start scheduler, launch bot
+// -------------------------------------------------------------
+// Render Web Service HTTP Health-Check Server
+// -------------------------------------------------------------
+const PORT = process.env.PORT || 3000;
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(
+      JSON.stringify({
+        status: 'ok',
+        message: '🤖 Telegram Task & Reminder Bot is running successfully!',
+        uptime_seconds: Math.floor(process.uptime()),
+        timestamp: new Date().toISOString(),
+        timezone: TIMEZONE,
+      })
+    );
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not Found');
+});
+
+// Bootstrap application: connect DB, start scheduler, launch bot & HTTP server
 async function startApp() {
   try {
     // 1. Initialize DB and verify table schema & indexes
@@ -641,6 +665,11 @@ async function startApp() {
 
     // 3. Launch Telegram Bot polling with resilient retry
     launchBotWithRetry(bot);
+
+    // 4. Start HTTP server to satisfy Render's port detection
+    server.listen(PORT, () => {
+      console.log(`🌐 HTTP health-check server listening on port ${PORT} (Render compatible)`);
+    });
 
     console.log('🤖 Telegram Bot is up and running with PostgreSQL persistence!');
   } catch (error) {
@@ -653,9 +682,12 @@ startApp();
 
 // Graceful shutdown handling
 const shutdown = async (signal) => {
-  console.log(`\nReceived ${signal}. Gracefully stopping bot, schedulers, and database pool...`);
+  console.log(`\nReceived ${signal}. Gracefully stopping bot, HTTP server, schedulers, and database pool...`);
   if (cronManager) cronManager.stop();
   bot.stop(signal);
+  server.close(() => {
+    console.log('🌐 HTTP server closed.');
+  });
   await pool.end();
   process.exit(0);
 };
