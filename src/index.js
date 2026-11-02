@@ -946,22 +946,22 @@ const server = http.createServer((req, res) => {
   res.end('Not Found');
 });
 
-// Bootstrap application: connect DB, start scheduler, launch bot & HTTP server
+// Bootstrap application: start HTTP server immediately for Render port scan, connect DB, start scheduler & launch bot
 async function startApp() {
   try {
-    // 1. Initialize DB and verify table schema & indexes
+    // 1. Start HTTP server immediately on 0.0.0.0 to satisfy Render's port detection
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`🌐 HTTP health-check server listening on 0.0.0.0:${PORT} (Render compatible)`);
+    });
+
+    // 2. Initialize DB and verify table schema & indexes
     await initDb();
 
-    // 2. Start background reminder, class alerts & morning briefing cron workers
+    // 3. Start background reminder, class alerts & morning briefing cron workers
     cronManager = startScheduler(bot);
 
-    // 3. Launch Telegram Bot polling with resilient retry
+    // 4. Launch Telegram Bot polling with resilient retry
     launchBotWithRetry(bot);
-
-    // 4. Start HTTP server to satisfy Render's port detection
-    server.listen(PORT, () => {
-      console.log(`🌐 HTTP health-check server listening on port ${PORT} (Render compatible)`);
-    });
 
     console.log('🤖 Telegram Bot is up and running with PostgreSQL persistence!');
   } catch (error) {
