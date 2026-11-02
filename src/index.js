@@ -1,7 +1,8 @@
-import { Telegraf } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import dotenv from 'dotenv';
 import dns from 'dns';
 import http from 'http';
+import crypto from 'crypto';
 import {
   initDb,
   createTask,
@@ -21,6 +22,12 @@ import {
   getCurrentDayOfWeek,
   getDayName,
 } from './scheduler.js';
+import {
+  translateKhmerToEnglish,
+  translateEnglishToKhmer,
+  fixEnglishGrammar,
+  getActiveAiProvider,
+} from './translator.js';
 
 // Force Node.js to use IPv4 first (prevents ECONNRESET on networks with broken/throttled IPv6)
 try {
@@ -98,6 +105,60 @@ function normalizeDayOfWeek(dayStr) {
   return map[clean] || null;
 }
 
+// Helper: Escape HTML entities to prevent Telegram parse errors
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// -------------------------------------------------------------
+// Translation Sessions Cache (Avoids Telegram 64-byte callback_data limit)
+// -------------------------------------------------------------
+const translationStore = new Map();
+
+function saveTranslationSession(text, chatId) {
+  const id = crypto.randomUUID ? crypto.randomUUID().slice(0, 8) : Math.random().toString(36).substring(2, 10);
+  translationStore.set(id, {
+    text,
+    chatId,
+    timestamp: Date.now(),
+  });
+
+  // Prune sessions older than 2 hours if map grows large
+  if (translationStore.size > 200) {
+    const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+    for (const [key, value] of translationStore.entries()) {
+      if (value.timestamp < twoHoursAgo) {
+        translationStore.delete(key);
+      }
+    }
+  }
+
+  return id;
+}
+
+// Extract original text from memory store or directly from message text if session expired
+function getTranslationText(sessionId, ctx) {
+  const session = translationStore.get(sessionId);
+  if (session && session.text) {
+    return session.text;
+  }
+
+  // Fallback: Attempt to extract from previous message text
+  const msgText = ctx.callbackQuery?.message?.text || '';
+  const match = msgText.match(/(?:Input Text|Original[^:]*):\s*\n([\s\S]+?)(?:\n\n|\nChoose|$)/i);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+
+  return null;
+}
+
 // Command: /start
 bot.start((ctx) => {
   const firstName = ctx.from?.first_name || 'there';
@@ -106,7 +167,7 @@ bot.start((ctx) => {
   const welcomeMessage = 
 `👋 Hello ${firstName}! Welcome to your *Personal Task & Reminder Bot*.
 
-I help you stay organized with automatic reminder alerts, weekly university/school schedules, and morning briefings!
+I help you stay organized with reminder alerts, university class schedules, and smart translation!
 
 🕒 *Current Bot Time:* \`${currentTime}\` (Timezone: \`${TIMEZONE}\`)
 
@@ -123,8 +184,12 @@ I help you stay organized with automatic reminder alerts, weekly university/scho
 • \`/today\` — View today's class schedule instantly
 • \`/schedule\` (or \`/timetable\`) — View your full weekly class timetable
 • \`/addschedule <DAY> <TIME> <Subject> | <Room>\` — Add a weekly class
-  _Example:_ \`/addschedule MON 08:00 System Analysis | Lab 202\`
 • \`/deleteschedule <id>\` — Remove a class schedule
+
+🌐 *Translation & Grammar Assistant:*
+• \`/translate <text>\` — Translate Khmer ↔️ English or fix English grammar
+  _Example:_ \`/translate ខ្ញុំរៀននៅសាកលវិទ្យាល័យភូមិន្ទភ្នំពេញ\`
+  _Example:_ \`/translate She do not likes apples\`
 
 ⚙️ *Utilities:*
 • \`/time\` — Check current clock & timezone
@@ -143,7 +208,7 @@ bot.help((ctx) => {
 `📖 *Command Guide:*
 
 📝 *Tasks:*
-• \`/add <time> <Task Name>\` — One-time task (e.g. \`/add 08:00 Team Standup\`)
+• \`/add <time> <Task Name>\` — One-time task
 • \`/add <time> <Task Name> daily\` — Daily recurring task
 • \`/list\` — Display your active tasks
 • \`/done <id>\` — Mark task done
@@ -153,8 +218,11 @@ bot.help((ctx) => {
 • \`/today\` — View today's class schedule instantly
 • \`/schedule\` — View full weekly timetable
 • \`/addschedule <DAY> <TIME> <Subject> | <Room>\`
-  _Example:_ \`/addschedule MON 08:00 System Analysis | Lab 202\`
 • \`/deleteschedule <id>\` — Delete a class
+
+🌐 *Language & AI Assistant:*
+• \`/translate <text>\` — Translate Khmer ↔️ English or check English grammar
+  _(Supports inline buttons for instant translation & grammar check!)_
 
 🕒 *System:*
 • \`/time\` — Check server clock and active timezone`;
@@ -588,6 +656,229 @@ bot.command(['seedschedule', 'seed'], async (ctx) => {
 });
 
 // -------------------------------------------------------------
+// Translation & Grammar Assistant Commands & Callbacks
+// -------------------------------------------------------------
+
+// Command: /translate <text> (also aliased to /tr)
+bot.command(['translate', 'tr'], async (ctx) => {
+  const messageText = ctx.message.text;
+  let payload = messageText.replace(/^\/(?:translate|tr)(?:@\w+)?\s*/i, '').trim();
+
+  // If no payload provided directly, check if user replied to another message
+  if (!payload && ctx.message.reply_to_message?.text) {
+    payload = ctx.message.reply_to_message.text.trim();
+  }
+
+  if (!payload) {
+    return ctx.replyWithHTML(
+      `🌐 <b>Translation & Grammar Assistant</b>\n\n` +
+      `<b>របៀបប្រើប្រាស់ (How to use):</b>\n` +
+      `• <code>/translate &lt;អត្ថបទរបស់អ្នក&gt;</code>\n\n` +
+      `<b>ឧទាហរណ៍ (Examples):</b>\n` +
+      `• <code>/translate ខ្ញុំរៀននៅសាកលវិទ្យាល័យភូមិន្ទភ្នំពេញ</code>\n` +
+      `• <code>/translate She do not likes apples yesterday</code>\n\n` +
+      `<i>Tip: You can also reply to any message with <code>/translate</code>!</i>`
+    );
+  }
+
+  // Safety truncation for extremely long messages
+  if (payload.length > 2000) {
+    payload = payload.slice(0, 2000);
+  }
+
+  const sessionId = saveTranslationSession(payload, ctx.chat.id);
+
+  const inlineKeyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🇰🇭 ➡️ 🇬🇧 Translate to English', `tr:km_en:${sessionId}`)],
+    [Markup.button.callback('🇬🇧 ➡️ 🇰🇭 Translate to Khmer', `tr:en_km:${sessionId}`)],
+    [Markup.button.callback('✨ Fix English Grammar', `tr:grammar:${sessionId}`)],
+  ]);
+
+  return ctx.replyWithHTML(
+    `🌐 <b>Translation & Grammar Assistant</b>\n\n` +
+    `📝 <b>Input Text:</b>\n<code>${escapeHtml(payload)}</code>\n\n` +
+    `<i>Choose an action below:</i>`,
+    inlineKeyboard
+  );
+});
+
+// Callback 1: 🇰🇭 ➡️ 🇬🇧 Translate to English
+bot.action(/^tr:km_en:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+  const sessionId = ctx.match[1];
+  const text = getTranslationText(sessionId, ctx);
+
+  if (!text) {
+    await ctx.answerCbQuery('⚠️ Session expired. Please send /translate again.');
+    return ctx.reply('⚠️ This translation request expired. Please type `/translate <text>` again.');
+  }
+
+  await ctx.answerCbQuery('Translating to English... 🇬🇧');
+
+  try {
+    const result = await translateKhmerToEnglish(text);
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('✨ Fix English Grammar', `tr:grammar:${sessionId}`),
+        Markup.button.callback('🇬🇧 ➡️ 🇰🇭 Translate to Khmer', `tr:en_km:${sessionId}`),
+      ],
+    ]);
+
+    const replyMessage = 
+`🌐 <b>Khmer ➡️ English Translation</b>
+
+🇰🇭 <b>Original (Khmer):</b>
+<code>${escapeHtml(text)}</code>
+
+🇬🇧 <b>English Translation:</b>
+<b>${escapeHtml(result.text)}</b>
+
+<i>(Powered by ${result.provider})</i>`;
+
+    try {
+      await ctx.editMessageText(replyMessage, {
+        parse_mode: 'HTML',
+        ...keyboard,
+      });
+    } catch (editErr) {
+      if (!editErr.message?.includes('message is not modified')) {
+        throw editErr;
+      }
+    }
+  } catch (err) {
+    console.error('Error translating to English:', err);
+    await ctx.reply('❌ Translation failed. Please try again.');
+  }
+});
+
+// Callback 2: 🇬🇧 ➡️ 🇰🇭 Translate to Khmer
+bot.action(/^tr:en_km:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+  const sessionId = ctx.match[1];
+  const text = getTranslationText(sessionId, ctx);
+
+  if (!text) {
+    await ctx.answerCbQuery('⚠️ Session expired. Please send /translate again.');
+    return ctx.reply('⚠️ This translation request expired. Please type `/translate <text>` again.');
+  }
+
+  await ctx.answerCbQuery('Translating to Khmer... 🇰🇭');
+
+  try {
+    const result = await translateEnglishToKhmer(text);
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('✨ Fix English Grammar', `tr:grammar:${sessionId}`),
+        Markup.button.callback('🇰🇭 ➡️ 🇬🇧 Translate to English', `tr:km_en:${sessionId}`),
+      ],
+    ]);
+
+    const replyMessage = 
+`🌐 <b>English ➡️ Khmer Translation</b>
+
+🇬🇧 <b>Original (English):</b>
+<code>${escapeHtml(text)}</code>
+
+🇰🇭 <b>Khmer Translation:</b>
+<b>${escapeHtml(result.text)}</b>
+
+<i>(Powered by ${result.provider})</i>`;
+
+    try {
+      await ctx.editMessageText(replyMessage, {
+        parse_mode: 'HTML',
+        ...keyboard,
+      });
+    } catch (editErr) {
+      if (!editErr.message?.includes('message is not modified')) {
+        throw editErr;
+      }
+    }
+  } catch (err) {
+    console.error('Error translating to Khmer:', err);
+    await ctx.reply('❌ Translation failed. Please try again.');
+  }
+});
+
+// Callback 3: ✨ Fix English Grammar
+bot.action(/^tr:grammar:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+  const sessionId = ctx.match[1];
+  const text = getTranslationText(sessionId, ctx);
+
+  if (!text) {
+    await ctx.answerCbQuery('⚠️ Session expired. Please send /translate again.');
+    return ctx.reply('⚠️ This translation request expired. Please type `/translate <text>` again.');
+  }
+
+  await ctx.answerCbQuery('Analyzing grammar with AI... ✨');
+
+  try {
+    const result = await fixEnglishGrammar(text);
+
+    if (!result.hasKey) {
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback('🇰🇭 ➡️ 🇬🇧 Translate to English', `tr:km_en:${sessionId}`),
+          Markup.button.callback('🇬🇧 ➡️ 🇰🇭 Translate to Khmer', `tr:en_km:${sessionId}`),
+        ],
+      ]);
+
+      const warningMessage = 
+`✨ <b>English Grammar Assistant</b>
+
+📝 <b>Input Text:</b>
+<code>${escapeHtml(text)}</code>
+
+⚠️ <b>AI API Key Required for Grammar Analysis</b>
+
+To enable AI grammar correction and explanations:
+1. Get a <b>free</b> Gemini API key from <a href="https://aistudio.google.com/">Google AI Studio</a>
+2. Add <code>GEMINI_API_KEY=your_key</code> in your <code>.env</code> file
+3. Restart your bot!
+
+<i>(Basic Khmer ↔️ English translations work right now via Google Translate!)</i>`;
+
+      return await ctx.editMessageText(warningMessage, {
+        parse_mode: 'HTML',
+        ...keyboard,
+      });
+    }
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback('🇬🇧 ➡️ 🇰🇭 Translate to Khmer', `tr:en_km:${sessionId}`)],
+    ]);
+
+    const replyMessage = 
+`✨ <b>English Grammar Correction & Analysis</b>
+
+❌ <b>Original Text:</b>
+<code>${escapeHtml(text)}</code>
+
+✅ <b>Corrected English:</b>
+<b>${escapeHtml(result.corrected)}</b>
+
+💡 <b>Explanation & Tips:</b>
+${escapeHtml(result.explanation)}
+
+<i>(Analyzed with ${result.provider})</i>`;
+
+    try {
+      await ctx.editMessageText(replyMessage, {
+        parse_mode: 'HTML',
+        ...keyboard,
+      });
+    } catch (editErr) {
+      if (!editErr.message?.includes('message is not modified')) {
+        throw editErr;
+      }
+    }
+  } catch (err) {
+    console.error('Error analyzing grammar:', err);
+    await ctx.reply(`❌ Grammar analysis failed: ${err.message || 'Please verify your GEMINI_API_KEY in .env.'}`);
+  }
+});
+
+// -------------------------------------------------------------
 // Application Lifecycle & Schedulers
 // -------------------------------------------------------------
 
@@ -606,6 +897,7 @@ async function launchBotWithRetry(targetBot, retries = 5, delayMs = 3000) {
         { command: 'start', description: 'ចាប់ផ្ដើមប្រើប្រាស់ Bot' },
         { command: 'today', description: 'មើលកាលវិភាគថ្ងៃនេះ (Today classes)' },
         { command: 'schedule', description: 'មើលកាលវិភាគសប្ដាហ៍ (Weekly Timetable)' },
+        { command: 'translate', description: 'បកប្រែ & កែវេយ្យាករណ៍ (Translate & Grammar)' },
         { command: 'add', description: 'បន្ថែម Task ថ្មី (ឧ. /add 19:30 រៀនកូដ daily)' },
         { command: 'list', description: 'មើលបញ្ជី Task ទាំងអស់' },
         { command: 'addschedule', description: 'បញ្ចូលកាលវិភាគ (ឧ. /addschedule MON 08:00...)' },

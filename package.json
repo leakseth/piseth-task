@@ -10,6 +10,7 @@
     "seed:schedule": "node scripts/seed-schedule.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.0",
     "dotenv": "^16.4.7",
     "node-cron": "^3.0.3",
     "pg": "^8.13.1",
