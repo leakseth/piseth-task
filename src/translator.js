@@ -173,9 +173,22 @@ async function callGemini(prompt) {
 
         lastError = new Error(`Gemini API [${modelPath}] (${response.status}): ${parsedMessage}`);
 
-        // If 404 (model name not found/deprecated) OR 429 (quota exceeded / limit: 0 on Pro models), try next model!
-        if (response.status === 404 || response.status === 429) {
-          console.warn(`⚠️ [${modelPath}] returned HTTP ${response.status} (limit 0 or not found). Auto-switching to next model...`);
+        // If 404 (not found), 429 (quota exceeded), 503 (high demand/overloaded), 500/502/504 (server issues)
+        if (
+          response.status === 404 ||
+          response.status === 429 ||
+          response.status === 503 ||
+          response.status === 500 ||
+          response.status === 502 ||
+          response.status === 504
+        ) {
+          console.warn(`⚠️ [${modelPath}] returned HTTP ${response.status} (${response.status === 503 ? 'high demand' : 'temporary error'}). Auto-switching to next model...`);
+          if (cachedModelPath === modelPath) {
+            cachedModelPath = null; // Clear failing cache so next call re-evaluates
+          }
+          if (response.status === 503) {
+            await new Promise((r) => setTimeout(r, 600)); // Short pause before switching
+          }
           continue;
         }
 
@@ -183,7 +196,21 @@ async function callGemini(prompt) {
       }
     } catch (err) {
       lastError = err;
-      if (err.message && (err.message.includes('404') || err.message.includes('429'))) {
+      const msg = (err.message || '').toLowerCase();
+      if (
+        msg.includes('404') ||
+        msg.includes('429') ||
+        msg.includes('503') ||
+        msg.includes('500') ||
+        msg.includes('502') ||
+        msg.includes('504') ||
+        msg.includes('high demand') ||
+        msg.includes('overloaded') ||
+        msg.includes('unavailable')
+      ) {
+        if (cachedModelPath === modelPath) {
+          cachedModelPath = null;
+        }
         continue;
       }
       throw err;
