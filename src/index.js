@@ -874,7 +874,22 @@ ${escapeHtml(result.explanation)}
     }
   } catch (err) {
     console.error('Error analyzing grammar:', err);
-    await ctx.reply(`❌ Grammar analysis failed: ${err.message || 'Please verify your GEMINI_API_KEY in .env.'}`);
+    const msg = err.message || '';
+
+    if (msg.includes('429') || msg.includes('quota') || msg.includes('RESOURCE_EXHAUSTED')) {
+      await ctx.reply(
+        '⚠️ <b>Gemini Quota Exceeded (Free Tier)</b>\n\n' +
+        'គណនី Google API របស់អ្នកបានប្រើប្រាស់អស់ Quota ប្រចាំថ្ងៃហើយ។\n' +
+        '💡 សូមបង្កើត API Key ថ្មីពី <a href="https://aistudio.google.com/">Google AI Studio</a> រួចដាក់ចូលក្នុង <code>GEMINI_API_KEY</code>។\n\n' +
+        '<i>(ចំណាំ៖ មុខងារបកប្រែខ្មែរ ↔️ អង់គ្លេស នៅតែដំណើរការធម្មតា ១០០%)</i>',
+        { parse_mode: 'HTML' }
+      );
+    } else {
+      await ctx.reply(
+        `❌ <b>Grammar analysis failed</b>\n\n<code>${escapeHtml(msg.slice(0, 300))}</code>\n\n💡 សូមពិនិត្យមើល <code>GEMINI_API_KEY</code> របស់អ្នកនៅក្នុង <code>.env</code>។`,
+        { parse_mode: 'HTML' }
+      );
+    }
   }
 });
 

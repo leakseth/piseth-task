@@ -40,63 +40,65 @@ async function getWorkingGeminiModel(apiKey) {
   // 1. If user explicitly specified GEMINI_MODEL in .env, prioritize it
   if (process.env.GEMINI_MODEL) {
     const raw = process.env.GEMINI_MODEL.trim().replace(/^models\//, '');
-    cachedModelPath = `v1beta/models/${raw}`;
-    return cachedModelPath;
+    return `v1beta/models/${raw}`;
   }
 
   // 2. Query the official models list for this specific API key
   try {
     const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-    const listRes = await fetch(listUrl);
+    const listRes = await fetch(listUrl, {
+      headers: {
+        'x-goog-api-key': apiKey,
+      },
+    });
+
     if (listRes.ok) {
       const data = await listRes.json();
       const models = data.models || [];
 
-      // Priority list: Flash models have 15 RPM / free quota on Google AI Studio
-      // (Pro models have limit 0 on free tier unless paid billing is enabled)
-      const priorityOrder = [
-        'gemini-2.0-flash',
-        'gemini-1.5-flash-latest',
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-8b',
-        'gemini-1.5-pro',
-        'gemini-pro',
-      ];
-
-      for (const pref of priorityOrder) {
-        const found = models.find(
-          (m) =>
-            m.supportedGenerationMethods?.includes('generateContent') &&
-            m.name &&
-            m.name.includes(pref)
-        );
-        if (found) {
-          cachedModelPath = `v1beta/${found.name}`;
-          console.log(`🤖 Auto-detected active Google model: ${cachedModelPath}`);
-          return cachedModelPath;
-        }
-      }
-
-      // Fallback: any model supporting generateContent
-      const fallbackAny = models.find(
-        (m) => m.supportedGenerationMethods?.includes('generateContent') && m.name?.includes('flash')
+      // Filter for models that support generateContent
+      const generativeModels = models.filter((m) =>
+        m.supportedGenerationMethods?.includes('generateContent')
       );
-      if (fallbackAny && fallbackAny.name) {
-        cachedModelPath = `v1beta/${fallbackAny.name}`;
-        return cachedModelPath;
+
+      // Priority list of flash models (15 RPM / free quota on Google AI Studio)
+      const flashModels = generativeModels.filter((m) =>
+        m.name && m.name.toLowerCase().includes('flash')
+      );
+
+      if (flashModels.length > 0) {
+        // Prefer modern 2.5-flash, flash-latest, flash-lite
+        const bestFlash =
+          flashModels.find((m) => m.name.includes('2.5-flash')) ||
+          flashModels.find((m) => m.name.includes('flash-latest')) ||
+          flashModels.find((m) => m.name.includes('flash-lite')) ||
+          flashModels.find((m) => m.name.includes('2.0-flash')) ||
+          flashModels[0];
+
+        const modelName = bestFlash.name.replace(/^models\//, '');
+        console.log(`🤖 Auto-detected active Gemini Flash model: ${modelName}`);
+        return `v1beta/models/${modelName}`;
       }
+
+      if (generativeModels.length > 0) {
+        const modelName = generativeModels[0].name.replace(/^models\//, '');
+        console.log(`🤖 Auto-detected available Gemini model: ${modelName}`);
+        return `v1beta/models/${modelName}`;
+      }
+    } else {
+      console.warn(`⚠️ Google models.list returned HTTP ${listRes.status}`);
     }
   } catch (err) {
-    console.warn('Could not auto-list Gemini models, using default fallbacks:', err.message);
+    console.warn('⚠️ Could not auto-list Gemini models, using default fallbacks:', err.message);
   }
 
-  // 3. Default fallback
-  return 'v1beta/models/gemini-2.0-flash';
+  // 3. Modern default fallback
+  return 'v1beta/models/gemini-2.5-flash';
 }
 
 /**
  * Call Google Gemini API with smart model auto-detection and fallback
- * Handles 404 (Not Found) and 429 (Quota exceeded / Pro model limit 0 on free tier)
+ * Handles 404 (Not Found / Deprecated) and 429 (Quota exceeded / Pro model limit 0 on free tier)
  */
 async function callGemini(prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -104,23 +106,35 @@ async function callGemini(prompt) {
     throw new Error('GEMINI_API_KEY_MISSING');
   }
 
-  const explicitModel = process.env.GEMINI_MODEL
-    ? `v1beta/models/${process.env.GEMINI_MODEL.trim().replace(/^models\//, '')}`
-    : null;
+  // Dynamically detected model
+  const detectedModel = await getWorkingGeminiModel(apiKey);
 
-  // Flash models first (100% free with 15 requests per minute on Google AI Studio)
-  const modelOptions = [
-    explicitModel,
-    await getWorkingGeminiModel(apiKey),
+  // Modern models list: Modern Flash models (Free tier friendly) -> Pro models -> Fallbacks
+  const candidateModels = [
+    // 1. User explicit GEMINI_MODEL
+    process.env.GEMINI_MODEL ? `v1beta/models/${process.env.GEMINI_MODEL.trim().replace(/^models\//, '')}` : null,
+    // 2. Previously cached working model
+    cachedModelPath,
+    // 3. Dynamically detected model
+    detectedModel,
+    // 4. Modern Flash generation (100% free with 15 RPM on Google AI Studio)
+    'v1beta/models/gemini-2.5-flash',
+    'v1beta/models/gemini-2.5-flash-lite',
+    'v1beta/models/gemini-flash-latest',
+    'v1beta/models/gemini-3.1-flash-lite',
     'v1beta/models/gemini-2.0-flash',
+    // 5. Pro models (require quota / billing on Google Cloud)
+    'v1beta/models/gemini-2.5-pro',
+    'v1beta/models/gemini-3.1-pro',
+    'v1beta/models/gemini-pro-latest',
+    // 6. Legacy fallbacks
+    'v1beta/models/gemini-1.5-flash',
     'v1beta/models/gemini-1.5-flash-latest',
-    'v1/models/gemini-1.5-flash',
-    'v1beta/models/gemini-1.5-flash-8b',
     'v1beta/models/gemini-1.5-pro',
   ];
 
   // Remove duplicates and falsy entries
-  const uniqueModels = [...new Set(modelOptions.filter(Boolean))];
+  const uniqueModels = [...new Set(candidateModels.filter(Boolean))];
 
   let lastError = null;
 
@@ -130,7 +144,10 @@ async function callGemini(prompt) {
 
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
@@ -143,14 +160,20 @@ async function callGemini(prompt) {
         const result = await response.json();
         const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
         if (text) {
-          cachedModelPath = modelPath; // Remember the working model!
+          cachedModelPath = modelPath; // Remember the winning model!
           return text.trim();
         }
       } else {
         const errorText = await response.text();
-        lastError = new Error(`Gemini API [${modelPath}] (${response.status}): ${errorText}`);
+        let parsedMessage = errorText;
+        try {
+          const parsed = JSON.parse(errorText);
+          parsedMessage = parsed.error?.message || errorText;
+        } catch (_) {}
 
-        // If 404 (model name not found) OR 429 (quota exceeded / limit: 0 on Pro models), try next model!
+        lastError = new Error(`Gemini API [${modelPath}] (${response.status}): ${parsedMessage}`);
+
+        // If 404 (model name not found/deprecated) OR 429 (quota exceeded / limit: 0 on Pro models), try next model!
         if (response.status === 404 || response.status === 429) {
           console.warn(`⚠️ [${modelPath}] returned HTTP ${response.status} (limit 0 or not found). Auto-switching to next model...`);
           continue;
