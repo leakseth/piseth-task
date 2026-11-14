@@ -6,6 +6,7 @@ import {
   getAllPendingTasksGroupedByChat,
   resetRecurringTasksForNewDay,
   getAllTodaySchedulesGroupedByChat,
+  getClassesByDayAndTime,
 } from './db.js';
 
 // Resolve timezone from .env or default to Asia/Phnom_Penh
@@ -18,6 +19,30 @@ export function formatTo12Hour(time24) {
   const hours12 = h % 12 || 12;
   return `${hours12}:${String(m).padStart(2, '0')} ${period}`;
 }
+
+// Helper: Get time offset by N minutes in 24h HH:mm format (e.g. for +15m class alerts or snooze)
+export function getTimePlusMinutes(minutesToAdd = 15, tz = TIMEZONE) {
+  try {
+    const now = new Date();
+    const future = new Date(now.getTime() + minutesToAdd * 60 * 1000);
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    return formatter.format(future);
+  } catch (err) {
+    const now = new Date();
+    const future = new Date(now.getTime() + minutesToAdd * 60 * 1000);
+    const h = String(future.getHours()).padStart(2, '0');
+    const m = String(future.getMinutes()).padStart(2, '0');
+    return `${h}:${m}`;
+  }
+}
+
+// In-memory set to prevent duplicate 15-minute class alerts on the same day
+const notifiedClassAlerts = new Set();
 
 // Helper: Get current time formatted as 24h HH:mm in the target timezone
 export function getCurrentTimeString(tz = TIMEZONE) {
@@ -132,9 +157,13 @@ export function startScheduler(bot) {
 ${recurringBadge}🆔 <b>Task ID:</b> <code>#${task.id}</code>
 ${recurringFooter}`;
 
-            // Inline Button: "✅ Mark as Done"
+            // Inline Buttons: "✅ Mark as Done", "⏰ Snooze 10m", "⏰ Snooze 30m"
             const inlineKeyboard = Markup.inlineKeyboard([
-              Markup.button.callback('✅ Mark as Done', `done:${task.id}`)
+              [Markup.button.callback('✅ Mark as Done', `done:${task.id}`)],
+              [
+                Markup.button.callback('⏰ Snooze 10m', `snooze:${task.id}:10`),
+                Markup.button.callback('⏰ Snooze 30m', `snooze:${task.id}:30`),
+              ],
             ]);
 
             // Dispatch message with auto-retry
@@ -152,6 +181,45 @@ ${recurringFooter}`;
             console.error(`❌ Failed to send reminder for Task #${task.id}:`, sendError.message);
           }
         }
+      }
+
+      // Feature 1: Smart 15-Minute Pre-Class Alert
+      try {
+        const targetClassTime = getTimePlusMinutes(15, TIMEZONE);
+        const todayDay = getCurrentDayOfWeek(TIMEZONE);
+        const upcomingClasses = await getClassesByDayAndTime(todayDay, targetClassTime);
+
+        if (upcomingClasses.length > 0) {
+          for (const c of upcomingClasses) {
+            const alertKey = `${todayDay}_${c.id}_${targetClassTime}`;
+            if (!notifiedClassAlerts.has(alertKey)) {
+              notifiedClassAlerts.add(alertKey);
+
+              const time12 = formatTo12Hour(c.time);
+              const alertMsg = 
+`🔔 <b>CLASS ALERT: Starting in 15 Minutes!</b>
+
+📚 <b>Subject:</b> ${c.subject}
+⏰ <b>Class Time:</b> <code>${c.time}</code> (${time12})
+📍 <b>Room:</b> <code>${c.room || 'N/A'}</code>
+
+<i>Pack your bag, get your study notes ready, and don't be late! 🎓🚀</i>`;
+
+              try {
+                await sendWithRetry(async () => {
+                  return await bot.telegram.sendMessage(c.chat_id, alertMsg, {
+                    parse_mode: 'HTML',
+                  });
+                });
+                console.log(`[${currentTime}] 🔔 Sent 15m pre-class alert to Chat ID ${c.chat_id} for: ${c.subject}`);
+              } catch (err) {
+                console.error(`❌ Failed to send 15m class alert to ${c.chat_id}:`, err.message);
+              }
+            }
+          }
+        }
+      } catch (classAlertErr) {
+        console.error('❌ Error checking 15m pre-class alerts:', classAlertErr.message);
       }
     } catch (dbError) {
       console.error('❌ Database error querying pending reminders:', dbError.message);
@@ -256,7 +324,8 @@ ${classListText}
       console.log(`[00:00 Midnight] 🔄 Resetting daily recurring tasks for the new day...`);
       try {
         const resetTasks = await resetRecurringTasksForNewDay();
-        console.log(`✅ Successfully reset ${resetTasks.length} recurring task(s) for the new day.`);
+        notifiedClassAlerts.clear();
+        console.log(`✅ Successfully reset ${resetTasks.length} recurring task(s) and cleared daily class alert cache.`);
       } catch (err) {
         console.error('❌ Failed to reset recurring tasks at midnight:', err.message);
       }

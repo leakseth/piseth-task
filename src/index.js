@@ -13,6 +13,8 @@ import {
   getSchedulesByChatId,
   getTodaySchedulesByChatId,
   deleteSchedule,
+  snoozeTask,
+  getUserStats,
   pool,
 } from './db.js';
 import {
@@ -21,11 +23,13 @@ import {
   getCurrentTimeString,
   getCurrentDayOfWeek,
   getDayName,
+  getTimePlusMinutes,
 } from './scheduler.js';
 import {
   translateKhmerToEnglish,
   translateEnglishToKhmer,
   fixEnglishGrammar,
+  processVoiceMessage,
   getActiveAiProvider,
 } from './translator.js';
 
@@ -226,6 +230,12 @@ I help you stay organized with reminder alerts, university class schedules, and 
 • \`/addschedule <DAY> <TIME> <Subject> | <Room>\` — Add a weekly class
 • \`/deleteschedule <id>\` — Remove a class schedule
 
+📊 *Productivity & Stats:*
+• \`/stats\` — View your task completion rates, habit streaks & study dashboard
+
+🎙️ *Voice Notes & Multimodal AI:*
+• Send any voice recording — Bot transcribes it, extracts tasks, and translates!
+
 🌐 *Translation & Grammar Assistant:*
 • \`/translate <text>\` — Translate Khmer ↔️ English or fix English grammar
   _Example:_ \`/translate ខ្ញុំរៀននៅសាកលវិទ្យាល័យភូមិន្ទភ្នំពេញ\`
@@ -236,7 +246,8 @@ I help you stay organized with reminder alerts, university class schedules, and 
 • \`/help\` — View this guide
 
 ✨ *Automations:*
-• 🔔 Reminders with interactive *[✅ Mark as Done]* buttons.
+• 🔔 Reminders with *[✅ Mark as Done]*, *[⏰ Snooze 10m]*, and *[⏰ Snooze 30m]* buttons.
+• 🔔 Smart *15-minute Pre-Class Alerts* before every class.
 • 🌅 Daily morning briefings & class schedule alerts at *07:00 AM*.`;
 
   return ctx.replyWithMarkdown(welcomeMessage);
@@ -472,6 +483,41 @@ ${footerNote}`;
   } catch (err) {
     console.error('Error handling done callback query:', err);
     await ctx.answerCbQuery('Could not complete task.');
+  }
+});
+
+// Interactive Inline Button Callback Query Handler: "⏰ Snooze 10m" & "⏰ Snooze 30m"
+bot.action(/^snooze:(\d+):(\d+)$/, async (ctx) => {
+  const taskId = parseInt(ctx.match[1], 10);
+  const minutes = parseInt(ctx.match[2], 10);
+
+  try {
+    const newTime = getTimePlusMinutes(minutes, TIMEZONE);
+    const updated = await snoozeTask(taskId, ctx.chat.id, newTime);
+
+    await ctx.answerCbQuery(`Task snoozed for ${minutes} minutes! ⏰`);
+
+    if (updated) {
+      const time12 = formatTo12Hour(newTime);
+      const snoozedMessage = 
+`⏰ <b>TASK SNOOZED FOR ${minutes} MINUTES</b>
+
+📌 <b>Task:</b> ${updated.task_name}
+⏱ <b>New Reminder Time:</b> <code>${newTime}</code> (${time12})
+🆔 <b>Task ID:</b> <code>#${updated.id}</code>
+
+<i>We will remind you again at ${newTime} (${time12})! Stay focused! 💪</i>`;
+
+      await ctx.editMessageText(snoozedMessage, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Mark as Done', `done:${updated.id}`)],
+        ]),
+      });
+    }
+  } catch (err) {
+    console.error('Error handling snooze callback query:', err);
+    await ctx.answerCbQuery('Could not snooze task.');
   }
 });
 
@@ -948,6 +994,190 @@ ${formatMarkdownToHtml(result.explanation)}
 });
 
 // -------------------------------------------------------------
+// Productivity & Study Statistics
+// -------------------------------------------------------------
+
+// Command: /stats (View personal productivity & study statistics)
+bot.command('stats', async (ctx) => {
+  try {
+    const stats = await getUserStats(ctx.chat.id);
+    const total = stats.total_tasks;
+    const completed = stats.completed_tasks;
+    const rate = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+    // Visual progress bar (10 blocks)
+    const filledBlocks = Math.round(rate / 10);
+    const emptyBlocks = 10 - filledBlocks;
+    const progressBar = '🟩'.repeat(filledBlocks) + '⬜'.repeat(emptyBlocks);
+
+    const statsMessage = 
+`📊 <b>Your Personal Productivity & Study Dashboard</b>
+
+🎯 <b>Task Completion Overview:</b>
+• Total Tasks Created: <b>${total}</b>
+• ✅ Completed Tasks: <b>${completed}</b>
+• ⏳ Pending Tasks: <b>${stats.pending_tasks}</b>
+• 🏆 Completion Rate: <b>${rate}%</b>
+<code>${progressBar}</code>
+
+🔄 <b>Habits & Daily Consistency:</b>
+• 🔁 Active Daily Routines: <b>${stats.recurring_tasks} habit(s)</b>
+
+📅 <b>Last 7 Days Momentum:</b>
+• 🚀 Tasks Created (7d): <b>${stats.tasks_last_7_days}</b>
+• ✨ Completed This Week: <b>${stats.completed_last_7_days}</b>
+
+📚 <b>Academic Course Load:</b>
+• 🎓 Weekly Classes: <b>${stats.total_classes} class(es) scheduled</b>
+
+<i>"Success is the sum of small efforts, repeated day in and day out."</i> 🔥`;
+
+    return ctx.replyWithHTML(statsMessage);
+  } catch (err) {
+    console.error('Error fetching stats:', err);
+    return ctx.reply('❌ Could not retrieve your stats. Please try again.');
+  }
+});
+
+// -------------------------------------------------------------
+// Voice Note to Text & Smart Task Assistant
+// -------------------------------------------------------------
+
+// In-memory store for 1-click voice task creations
+const voiceTaskStore = new Map();
+
+bot.on(['voice', 'audio'], async (ctx) => {
+  const voice = ctx.message.voice || ctx.message.audio;
+  if (!voice) return;
+
+  const statusMsg = await ctx.reply('🎙️ <i>Listening and transcribing your voice note with AI...</i> ✨', {
+    parse_mode: 'HTML',
+  });
+
+  try {
+    // 1. Get audio file link from Telegram
+    const fileLink = await ctx.telegram.getFileLink(voice.file_id);
+
+    // 2. Download audio into memory
+    const audioRes = await fetch(fileLink.href);
+    if (!audioRes.ok) {
+      throw new Error(`Failed to download voice file from Telegram: ${audioRes.status}`);
+    }
+
+    const arrayBuffer = await audioRes.arrayBuffer();
+    const base64Audio = Buffer.from(arrayBuffer).toString('base64');
+    const mimeType = voice.mime_type || 'audio/ogg';
+
+    // 3. Process with Gemini Multimodal AI
+    const result = await processVoiceMessage(base64Audio, mimeType);
+
+    if (!result.transcript) {
+      return await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        undefined,
+        '⚠️ <i>Could not clearly detect speech in the audio. Please try speaking closer to your microphone.</i>',
+        { parse_mode: 'HTML' }
+      );
+    }
+
+    // Save session for translation or task creation
+    const sessionId = saveTranslationSession(result.transcript, ctx.chat.id);
+    const buttons = [];
+
+    // If a task reminder was detected in voice, provide a 1-click add button!
+    if (result.is_task && result.suggested_time) {
+      voiceTaskStore.set(sessionId, {
+        task_name: result.task_name,
+        time: result.suggested_time,
+        chatId: ctx.chat.id,
+      });
+
+      const time12 = formatTo12Hour(result.suggested_time);
+      buttons.push([
+        Markup.button.callback(`➕ Add Task: ${result.suggested_time} (${time12})`, `vtask:${sessionId}`),
+      ]);
+    }
+
+    // Translation & Grammar buttons
+    buttons.push([
+      Markup.button.callback('🇰🇭 ➡️ 🇬🇧 Translate', `tr:km_en:${sessionId}`),
+      Markup.button.callback('🇬🇧 ➡️ 🇰🇭 Translate', `tr:en_km:${sessionId}`),
+    ]);
+    buttons.push([
+      Markup.button.callback('✨ Fix English Grammar', `tr:grammar:${sessionId}`),
+    ]);
+
+    const keyboard = Markup.inlineKeyboard(buttons);
+
+    const taskNotice = result.is_task && result.suggested_time
+      ? `\n\n💡 <b>Detected Reminder:</b> <code>[${result.suggested_time}]</code> ${escapeHtml(result.task_name)}`
+      : '';
+
+    const replyText = 
+`🎙️ <b>Voice Note Transcribed:</b>
+
+📝 <b>Spoken Text:</b>
+<code>${escapeHtml(result.transcript)}</code>${taskNotice}
+
+<i>Choose an action below:</i>`;
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      undefined,
+      replyText,
+      {
+        parse_mode: 'HTML',
+        ...keyboard,
+      }
+    );
+  } catch (err) {
+    console.error('Error handling voice note:', err);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      undefined,
+      `⚠️ <b>Voice transcription failed:</b> ${escapeHtml(err.message || 'Please check your GEMINI_API_KEY in .env.')}`,
+      { parse_mode: 'HTML' }
+    );
+  }
+});
+
+// Action Handler: 1-Click create task from voice note
+bot.action(/^vtask:(.+)$/, async (ctx) => {
+  const sessionId = ctx.match[1];
+  const item = voiceTaskStore.get(sessionId);
+
+  if (!item) {
+    return ctx.answerCbQuery('⚠️ This task creation session expired. Please send a new voice note.');
+  }
+
+  try {
+    const newTask = await createTask(ctx.chat.id, item.task_name, item.time, false);
+    voiceTaskStore.delete(sessionId);
+    await ctx.answerCbQuery('Task created successfully! 🎉');
+
+    const time12 = formatTo12Hour(item.time);
+    const successMsg = 
+`✅ <b>VOICE TASK CREATED!</b>
+
+📌 <b>Task:</b> ${escapeHtml(newTask.task_name)}
+⏰ <b>Reminder Time:</b> <code>${newTask.reminder_time}</code> (${time12})
+🆔 <b>Task ID:</b> <code>#${newTask.id}</code>
+
+<i>You will be reminded at ${newTask.reminder_time} (${time12})!</i>`;
+
+    await ctx.editMessageText(successMsg, {
+      parse_mode: 'HTML',
+    });
+  } catch (err) {
+    console.error('Error creating voice task:', err);
+    await ctx.answerCbQuery('Could not save task.');
+  }
+});
+
+// -------------------------------------------------------------
 // Application Lifecycle & Schedulers
 // -------------------------------------------------------------
 
@@ -962,6 +1192,7 @@ async function launchBotWithRetry(targetBot) {
       { command: 'start', description: 'ចាប់ផ្ដើមប្រើប្រាស់ Bot' },
       { command: 'today', description: 'មើលកាលវិភាគថ្ងៃនេះ (Today classes)' },
       { command: 'schedule', description: 'មើលកាលវិភាគសប្ដាហ៍ (Weekly Timetable)' },
+      { command: 'stats', description: 'មើលស្ថិតិការងារ & ការសិក្សា (Productivity stats)' },
       { command: 'translate', description: 'បកប្រែ & កែវេយ្យាករណ៍ (Translate & Grammar)' },
       { command: 'add', description: 'បន្ថែម Task ថ្មី (ឧ. /add 19:30 រៀនកូដ daily)' },
       { command: 'list', description: 'មើលបញ្ជី Task ទាំងអស់' },

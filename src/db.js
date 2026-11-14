@@ -287,3 +287,64 @@ export async function getTodaySchedulesByChatId(chatId, dayOfWeek) {
   const { rows } = await pool.query(query, [chatId, dayOfWeek]);
   return rows;
 }
+
+// 6. Fetch classes matching a specific day and exact time (e.g. for 15-minute pre-class alerts)
+export async function getClassesByDayAndTime(dayOfWeek, time) {
+  const query = `
+    SELECT id, chat_id, day_of_week, time, subject, room, created_at
+    FROM schedules
+    WHERE day_of_week = $1 AND time = $2
+    ORDER BY chat_id, id ASC;
+  `;
+  const { rows } = await pool.query(query, [dayOfWeek, time]);
+  return rows;
+}
+
+// 7. Snooze a task to a new reminder time
+export async function snoozeTask(taskId, chatId, newReminderTime) {
+  const query = `
+    UPDATE tasks
+    SET reminder_time = $1, is_notified = FALSE, status = 'PENDING'
+    WHERE id = $2 AND chat_id = $3
+    RETURNING id, chat_id, task_name, reminder_time, status, is_completed, is_notified, is_recurring;
+  `;
+  const { rows } = await pool.query(query, [newReminderTime, taskId, chatId]);
+  return rows[0];
+}
+
+// 8. Fetch comprehensive productivity & study statistics for a user
+export async function getUserStats(chatId) {
+  const taskQuery = `
+    SELECT 
+      COUNT(*) AS total_tasks,
+      COUNT(*) FILTER (WHERE is_completed = TRUE OR status = 'COMPLETED') AS completed_tasks,
+      COUNT(*) FILTER (WHERE is_completed = FALSE AND status = 'PENDING') AS pending_tasks,
+      COUNT(*) FILTER (WHERE is_recurring = TRUE) AS recurring_tasks,
+      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') AS tasks_last_7_days,
+      COUNT(*) FILTER (WHERE (is_completed = TRUE OR status = 'COMPLETED') AND created_at >= NOW() - INTERVAL '7 days') AS completed_last_7_days
+    FROM tasks
+    WHERE chat_id = $1;
+  `;
+
+  const scheduleQuery = `
+    SELECT COUNT(*) AS total_classes
+    FROM schedules
+    WHERE chat_id = $1;
+  `;
+
+  const [taskRes, scheduleRes] = await Promise.all([
+    pool.query(taskQuery, [chatId]),
+    pool.query(scheduleQuery, [chatId]),
+  ]);
+
+  const t = taskRes.rows[0] || {};
+  return {
+    total_tasks: parseInt(t.total_tasks || '0', 10),
+    completed_tasks: parseInt(t.completed_tasks || '0', 10),
+    pending_tasks: parseInt(t.pending_tasks || '0', 10),
+    recurring_tasks: parseInt(t.recurring_tasks || '0', 10),
+    tasks_last_7_days: parseInt(t.tasks_last_7_days || '0', 10),
+    completed_last_7_days: parseInt(t.completed_last_7_days || '0', 10),
+    total_classes: parseInt(scheduleRes.rows[0]?.total_classes || '0', 10),
+  };
+}

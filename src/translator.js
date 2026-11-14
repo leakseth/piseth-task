@@ -175,7 +175,7 @@ async function callGemini(prompt) {
           'x-goog-api-key': apiKey,
         },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
+          contents: [{ parts: Array.isArray(prompt) ? prompt : [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.2,
           },
@@ -421,4 +421,66 @@ Format your response in EXACTLY this structure:
     explanation,
     provider,
   };
+}
+
+/**
+ * 4. Transcribe voice messages & extract task/reminders using Gemini Multimodal Audio
+ */
+export async function processVoiceMessage(base64Audio, mimeType = 'audio/ogg') {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY_MISSING');
+  }
+
+  const prompt = 
+`You are an expert multilingual speech-to-text and task-assistant AI.
+Listen carefully to the attached voice recording.
+
+Your goals:
+1. Transcribe the spoken words accurately and naturally. The speaker may speak in Khmer, English, or a mix of Khmer and English.
+2. Determine if the speaker wants to create a reminder or task (e.g. mentions doing an activity at a certain time, like "remind me at 19:30 to study", "កុំភ្លេចរៀនកូដម៉ោង ៨ យប់", "tomorrow morning at 7am buy coffee", etc.).
+
+Format your output in EXACTLY this JSON structure:
+{
+  "transcript": "<verbatim transcribed text>",
+  "language": "<Khmer | English | Mixed>",
+  "is_task": true or false,
+  "task_name": "<clean task description if is_task is true, else empty string>",
+  "suggested_time": "<24-hour time HH:mm if time was mentioned, e.g. 19:30 or 08:00, else empty string>"
+}
+IMPORTANT: Output ONLY the valid raw JSON object. Do not wrap in markdown code fences (\`\`\`json) and do not add any additional commentary.`;
+
+  const cleanMime = mimeType.split(';')[0].trim() || 'audio/ogg';
+
+  const parts = [
+    { text: prompt },
+    {
+      inlineData: {
+        mimeType: cleanMime,
+        data: base64Audio,
+      },
+    },
+  ];
+
+  const raw = await callGemini(parts);
+
+  const cleanJson = raw.replace(/^```(json)?/i, '').replace(/```$/g, '').trim();
+
+  try {
+    const parsed = JSON.parse(cleanJson);
+    return {
+      transcript: parsed.transcript || '',
+      language: parsed.language || 'English',
+      is_task: Boolean(parsed.is_task && parsed.suggested_time),
+      task_name: parsed.task_name || parsed.transcript || '',
+      suggested_time: parsed.suggested_time || '',
+    };
+  } catch (parseErr) {
+    return {
+      transcript: raw.trim(),
+      language: 'Unknown',
+      is_task: false,
+      task_name: '',
+      suggested_time: '',
+    };
+  }
 }
