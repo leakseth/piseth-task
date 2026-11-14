@@ -48,6 +48,20 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// Global Telegraf error boundary to prevent polling crashes
+bot.catch((err, ctx) => {
+  console.error(`❌ Telegraf unhandled error on update (${ctx?.updateType || 'unknown'}):`, err.message || err);
+});
+
+// Process-level crash prevention guards
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Promise Rejection prevented crash:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception prevented crash:', err);
+});
+
 // Helper: convert 24h HH:mm to friendly 12h format (e.g. 14:15 -> 2:15 PM)
 function formatTo12Hour(time24) {
   const [h, m] = time24.split(':').map((v) => parseInt(v, 10));
@@ -907,40 +921,44 @@ ${escapeHtml(result.explanation)}
 // Reference to background cron manager for graceful teardown
 let cronManager = null;
 
-// Helper: Resilient launch with automatic retry for transient network hiccups
-async function launchBotWithRetry(targetBot, retries = 5, delayMs = 3000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+// Helper: Resilient launch with infinite automatic reconnect
+async function launchBotWithRetry(targetBot) {
+  // 1. Sync bot commands with Telegram's menu button BEFORE entering polling loop
+  try {
+    await targetBot.telegram.setMyCommands([
+      { command: 'start', description: 'ចាប់ផ្ដើមប្រើប្រាស់ Bot' },
+      { command: 'today', description: 'មើលកាលវិភាគថ្ងៃនេះ (Today classes)' },
+      { command: 'schedule', description: 'មើលកាលវិភាគសប្ដាហ៍ (Weekly Timetable)' },
+      { command: 'translate', description: 'បកប្រែ & កែវេយ្យាករណ៍ (Translate & Grammar)' },
+      { command: 'add', description: 'បន្ថែម Task ថ្មី (ឧ. /add 19:30 រៀនកូដ daily)' },
+      { command: 'list', description: 'មើលបញ្ជី Task ទាំងអស់' },
+      { command: 'addschedule', description: 'បញ្ចូលកាលវិភាគ (ឧ. /addschedule MON 08:00...)' },
+      { command: 'deleteschedule', description: 'លុបកាលវិភាគ (ឧ. /deleteschedule 1)' },
+      { command: 'seedschedule', description: 'បញ្ចូលកាលវិភាគឆ្នាំទី៣ CS ដោយស្វ័យប្រវត្តិ' },
+      { command: 'done', description: 'សម្គាល់ Task ថាបានរួចរាល់ (ឧ. /done 1)' },
+      { command: 'delete', description: 'លុប Task ចោល (ឧ. /delete 1)' },
+      { command: 'time', description: 'ពិនិត្យម៉ោង និង Timezone' },
+      { command: 'help', description: 'មើលការណែនាំពីរបៀបប្រើ' },
+    ]);
+    console.log('✅ Telegram menu commands synced successfully.');
+  } catch (err) {
+    console.warn('⚠️ Could not auto-sync menu commands:', err.message);
+  }
+
+  // 2. Continuous Polling Loop: Never gives up, automatically reconnects on any disconnect
+  let reconnectCount = 0;
+  while (true) {
     try {
-      await targetBot.launch();
+      console.log('🤖 Starting Telegram Bot polling...');
+      await targetBot.launch({
+        dropPendingUpdates: false,
+      });
       console.log('🤖 Telegram Bot polling started successfully.');
-
-      // Automatically sync bot commands with Telegram's menu button
-      await targetBot.telegram.setMyCommands([
-        { command: 'start', description: 'ចាប់ផ្ដើមប្រើប្រាស់ Bot' },
-        { command: 'today', description: 'មើលកាលវិភាគថ្ងៃនេះ (Today classes)' },
-        { command: 'schedule', description: 'មើលកាលវិភាគសប្ដាហ៍ (Weekly Timetable)' },
-        { command: 'translate', description: 'បកប្រែ & កែវេយ្យាករណ៍ (Translate & Grammar)' },
-        { command: 'add', description: 'បន្ថែម Task ថ្មី (ឧ. /add 19:30 រៀនកូដ daily)' },
-        { command: 'list', description: 'មើលបញ្ជី Task ទាំងអស់' },
-        { command: 'addschedule', description: 'បញ្ចូលកាលវិភាគ (ឧ. /addschedule MON 08:00...)' },
-        { command: 'deleteschedule', description: 'លុបកាលវិភាគ (ឧ. /deleteschedule 1)' },
-        { command: 'seedschedule', description: 'បញ្ចូលកាលវិភាគឆ្នាំទី៣ CS ដោយស្វ័យប្រវត្តិ' },
-        { command: 'done', description: 'សម្គាល់ Task ថាបានរួចរាល់ (ឧ. /done 1)' },
-        { command: 'delete', description: 'លុប Task ចោល (ឧ. /delete 1)' },
-        { command: 'time', description: 'ពិនិត្យម៉ោង និង Timezone' },
-        { command: 'help', description: 'មើលការណែនាំពីរបៀបប្រើ' },
-      ]).catch((err) => console.warn('⚠️ Could not auto-sync menu commands:', err.message));
-
       return;
     } catch (err) {
-      console.warn(`⚠️ Telegram connection attempt ${attempt}/${retries} failed (${err.code || err.message}). Retrying in ${delayMs / 1000}s...`);
-      if (attempt === retries) {
-        console.error('❌ Could not connect to Telegram API after multiple attempts.');
-        console.error('💡 Hint: Your ISP or network may be resetting connections to api.telegram.org.');
-        console.error('👉 Tip: Turn on Cloudflare WARP (1.1.1.1) or a VPN on your PC to bypass ISP blocking.');
-      } else {
-        await new Promise((res) => setTimeout(res, delayMs));
-      }
+      reconnectCount++;
+      console.error(`⚠️ Telegram polling interrupted (${err.code || err.message}). Reconnecting in 5s (attempt ${reconnectCount})...`);
+      await new Promise((res) => setTimeout(res, 5000));
     }
   }
 }
@@ -986,6 +1004,20 @@ async function startApp() {
     launchBotWithRetry(bot);
 
     console.log('🤖 Telegram Bot is up and running with PostgreSQL persistence!');
+
+    // 5. Render Free Tier Anti-Sleep Self-Pinger (pings every 10 mins to keep container awake)
+    const externalUrl = process.env.RENDER_EXTERNAL_URL;
+    if (externalUrl) {
+      console.log(`⏱️ Anti-sleep self-pinger active for: ${externalUrl}`);
+      setInterval(async () => {
+        try {
+          const res = await fetch(`${externalUrl}/health`);
+          console.log(`💓 Keep-alive ping sent to ${externalUrl}/health (${res.status})`);
+        } catch (pingErr) {
+          console.warn('⚠️ Keep-alive self-ping failed:', pingErr.message);
+        }
+      }, 10 * 60 * 1000); // 10 minutes
+    }
   } catch (error) {
     console.error('❌ Failed to start application:', error);
     process.exit(1);

@@ -25,6 +25,11 @@ const poolConfig = process.env.DATABASE_URL
 
 export const pool = new Pool(poolConfig);
 
+// Handle idle client errors on serverless PostgreSQL (e.g. Neon drops idle sockets)
+pool.on('error', (err) => {
+  console.warn('⚠️ PostgreSQL pool idle client warning (handled):', err.message);
+});
+
 // Initialize database schema (runs on startup)
 export async function initDb() {
   const createTableQuery = `
