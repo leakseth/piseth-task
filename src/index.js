@@ -931,6 +931,13 @@ ${formatMarkdownToHtml(result.explanation)}
         '👉 <b>សូមចុចប៊ូតុង "✨ Fix English Grammar" សាកល្បងម្ដងទៀតឥឡូវនេះ</b> (ប្រព័ន្ធនឹងប្ដូរទៅម៉ូដែលផ្សេងទៀតដោយស្វ័យប្រវត្តិ)។',
         { parse_mode: 'HTML' }
       );
+    } else if (msg.includes('fetch failed') || msg.includes('timeout') || msg.includes('network') || msg.includes('econnreset')) {
+      await ctx.reply(
+        '🌐 <b>Network Connection Hiccup</b>\n\n' +
+        'ការតភ្ជាប់ទៅកាន់ម៉ាស៊ីនមេ Google AI មានភាពរអាក់រអួលបណ្ដោះអាសន្ន។\n' +
+        '👉 <b>សូមចុចប៊ូតុង "✨ Fix English Grammar" សាកល្បងម្ដងទៀតឥឡូវនេះ</b>។',
+        { parse_mode: 'HTML' }
+      );
     } else {
       await ctx.reply(
         `❌ <b>Grammar analysis failed</b>\n\n<code>${escapeHtml(msg.slice(0, 300))}</code>\n\n💡 សូមពិនិត្យមើល <code>GEMINI_API_KEY</code> របស់អ្នកនៅក្នុង <code>.env</code>។`,

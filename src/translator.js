@@ -97,6 +97,32 @@ async function getWorkingGeminiModel(apiKey) {
 }
 
 /**
+ * Resilient fetch with automatic retries for transient network drops (fetch failed, timeouts)
+ */
+async function fetchWithRetry(url, options, maxRetries = 2, delayMs = 800) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+      return response;
+    } catch (err) {
+      if (attempt === maxRetries) {
+        throw err;
+      }
+      console.warn(`⚠️ Network fetch attempt ${attempt} failed (${err.message || 'connection issue'}). Retrying in ${delayMs / 1000}s...`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
+/**
  * Call Google Gemini API with smart model auto-detection and fallback
  * Handles 404 (Not Found / Deprecated) and 429 (Quota exceeded / Pro model limit 0 on free tier)
  */
@@ -142,7 +168,7 @@ async function callGemini(prompt) {
     try {
       const url = `https://generativelanguage.googleapis.com/${modelPath}:generateContent?key=${apiKey}`;
 
-      const response = await fetch(url, {
+      const response = await fetchWithRetry(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -198,6 +224,12 @@ async function callGemini(prompt) {
       lastError = err;
       const msg = (err.message || '').toLowerCase();
       if (
+        msg.includes('fetch failed') ||
+        msg.includes('abort') ||
+        msg.includes('timeout') ||
+        msg.includes('econnreset') ||
+        msg.includes('etimedout') ||
+        msg.includes('enotfound') ||
         msg.includes('404') ||
         msg.includes('429') ||
         msg.includes('503') ||
@@ -211,6 +243,7 @@ async function callGemini(prompt) {
         if (cachedModelPath === modelPath) {
           cachedModelPath = null;
         }
+        console.warn(`⚠️ [${modelPath}] encountered network/API issue (${err.message}). Trying next candidate model...`);
         continue;
       }
       throw err;
