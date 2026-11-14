@@ -354,10 +354,11 @@ Check for grammatical mistakes, spelling, punctuation, preposition usage, verb t
 
 Format your response in EXACTLY this structure:
 [CORRECTED]
-<Write the corrected, natural English sentence here. If it was already 100% correct, write it cleanly.>
+<Write ONLY the single corrected, natural English sentence here. Do not add quotes or commentary.>
 
 [EXPLANATION]
-<Provide 2-4 concise, clear bullet points explaining what was wrong, why the change was made, or confirming why the sentence was already correct. Write explanations in clear, friendly English with simple words.>`;
+• **Key Issue:** Clear, simple explanation of what was changed and why.
+• **Another Point:** Another clear point if applicable (keep to 2-3 concise bullet points).`;
 
   let raw = '';
   let provider = 'Gemini AI';
@@ -374,10 +375,10 @@ Format your response in EXACTLY this structure:
 
   if (raw.includes('[CORRECTED]') && raw.includes('[EXPLANATION]')) {
     const parts = raw.split('[EXPLANATION]');
-    corrected = parts[0].replace('[CORRECTED]', '').trim();
+    corrected = parts[0].replace('[CORRECTED]', '').trim().replace(/^["'`]|["'`]$/g, '');
     explanation = parts[1].trim();
   } else {
-    corrected = raw.trim();
+    corrected = raw.trim().replace(/^["'`]|["'`]$/g, '');
     explanation = 'Grammar and sentence phrasing refined for clarity.';
   }
 

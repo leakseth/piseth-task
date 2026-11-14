@@ -130,6 +130,32 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+// Helper: Convert AI Markdown formatting into clean, beautiful Telegram HTML
+function formatMarkdownToHtml(markdownText) {
+  if (!markdownText) return '';
+
+  // 1. Escape HTML special characters
+  let safe = String(markdownText)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // 2. Bold: **text** or __text__ -> <b>text</b>
+  safe = safe.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+  safe = safe.replace(/__(.*?)__/g, '<b>$1</b>');
+
+  // 3. Bullet points: * Item or - Item at start of line -> • Item
+  safe = safe.replace(/^\s*[\*\-]\s+/gm, '• ');
+
+  // 4. Inline code: `text` -> <code>text</code>
+  safe = safe.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // 5. Clean up any leftover stray asterisks from markdown bolding
+  safe = safe.replace(/\s*\*\s*\*/g, '');
+
+  return safe.trim();
+}
+
 // -------------------------------------------------------------
 // Translation Sessions Cache (Avoids Telegram 64-byte callback_data limit)
 // -------------------------------------------------------------
@@ -872,7 +898,7 @@ To enable AI grammar correction and explanations:
 <b>${escapeHtml(result.corrected)}</b>
 
 💡 <b>Explanation & Tips:</b>
-${escapeHtml(result.explanation)}
+${formatMarkdownToHtml(result.explanation)}
 
 <i>(Analyzed with ${result.provider})</i>`;
 
