@@ -46,6 +46,39 @@ export function getTimePlusMinutes(minutesToAdd = 15, tz = TIMEZONE) {
 // In-memory set to prevent duplicate 15-minute class alerts on the same day
 const notifiedClassAlerts = new Set();
 
+// Smart in-memory cache to save 95%+ of Neon Compute Unit hours (allows Neon to auto-sleep)
+let cachedPendingTasks = [];
+let cachedTodayClasses = [];
+let lastCacheSync = 0;
+const CACHE_TTL_MS = 60 * 60 * 1000; // Refresh from DB once per hour (or instantly on user action)
+
+export async function refreshSchedulerCache() {
+  try {
+    const todayDay = getCurrentDayOfWeek(TIMEZONE);
+    const [tasksGrouped, classesGrouped] = await Promise.all([
+      getAllPendingTasksGroupedByChat(),
+      getAllTodaySchedulesGroupedByChat(todayDay),
+    ]);
+
+    const tasks = [];
+    for (const chatId in tasksGrouped) {
+      tasks.push(...tasksGrouped[chatId]);
+    }
+
+    const classes = [];
+    for (const chatId in classesGrouped) {
+      classes.push(...classesGrouped[chatId]);
+    }
+
+    cachedPendingTasks = tasks;
+    cachedTodayClasses = classes;
+    lastCacheSync = Date.now();
+    console.log(`🧠 In-memory scheduler cache synced (${tasks.length} task(s), ${classes.length} class(es)). Neon can auto-sleep 💤`);
+  } catch (err) {
+    console.warn('⚠️ Could not refresh in-memory scheduler cache:', err.message);
+  }
+}
+
 // Helper: Get current time formatted as 24h HH:mm in the target timezone
 export function getCurrentTimeString(tz = TIMEZONE) {
   try {
@@ -134,12 +167,23 @@ export function startScheduler(bot) {
   console.log(`🌅 Morning briefing & Class schedule alerts started (daily at 07:00 AM). Timezone: "${TIMEZONE}".`);
   console.log(`🔄 Daily recurring reset worker started (daily at 00:00 Midnight). Timezone: "${TIMEZONE}".`);
 
-  // Job 1: Minute-by-Minute Task Reminder Worker
+  // Initial sync on scheduler startup
+  refreshSchedulerCache();
+
+  // Job 1: Minute-by-Minute Task Reminder Worker (Runs in-memory to let Neon auto-sleep 💤)
   const reminderJob = cron.schedule('* * * * *', async () => {
     const currentTime = getCurrentTimeString(TIMEZONE);
 
     try {
-      const pendingTasks = await getPendingReminders(currentTime);
+      // Sync cache from DB if empty or older than 1 hour (allows Neon to stay asleep 95% of the time)
+      if (!lastCacheSync || Date.now() - lastCacheSync > CACHE_TTL_MS) {
+        await refreshSchedulerCache();
+      }
+
+      // Check due tasks in-memory (0 SQL queries!)
+      const pendingTasks = cachedPendingTasks.filter(
+        (t) => t.reminder_time <= currentTime && !t.is_notified && t.status !== 'COMPLETED'
+      );
 
       if (pendingTasks.length > 0) {
         console.log(`[${currentTime}] 🔔 Found ${pendingTasks.length} pending reminder(s) to dispatch!`);
@@ -176,8 +220,9 @@ ${recurringFooter}`;
               });
             });
 
-            // Mark task as notified in the database (records today's date for recurring tasks)
+            // Mark task as notified in DB and update in-memory cache
             await markTaskAsNotified(task.id);
+            task.is_notified = true;
             console.log(`✅ Reminder sent for Task #${task.id} (Recurring: ${task.is_recurring}) to Chat ID: ${task.chat_id}`);
           } catch (sendError) {
             console.error(`❌ Failed to send reminder for Task #${task.id}:`, sendError.message);
@@ -185,11 +230,11 @@ ${recurringFooter}`;
         }
       }
 
-      // Feature 1: Smart 15-Minute Pre-Class Alert
+      // Feature 1: Smart 15-Minute Pre-Class Alert (Runs in-memory, 0 SQL queries!)
       try {
         const targetClassTime = getTimePlusMinutes(15, TIMEZONE);
         const todayDay = getCurrentDayOfWeek(TIMEZONE);
-        const upcomingClasses = await getClassesByDayAndTime(todayDay, targetClassTime);
+        const upcomingClasses = cachedTodayClasses.filter((c) => c.time === targetClassTime);
 
         if (upcomingClasses.length > 0) {
           for (const c of upcomingClasses) {

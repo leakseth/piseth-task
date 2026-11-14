@@ -35,6 +35,7 @@ import {
   getCurrentDayOfWeek,
   getDayName,
   getTimePlusMinutes,
+  refreshSchedulerCache,
 } from './scheduler.js';
 import {
   translateKhmerToEnglish,
@@ -391,8 +392,10 @@ bot.command('add', async (ctx) => {
       warning = `\n\n⚠️ *Notice:* You wrote \`${rawTime}\`, which is *${time12}* (early morning!). If you meant this afternoon/evening, use \`${pmHour}:${minutes}\` or \`${rawTime} PM\`.`;
     }
 
+    // Refresh scheduler in-memory cache so newly created task is registered immediately
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
+
     return ctx.replyWithMarkdown(
-      `✅ *Task Scheduled!*
 
 🆔 *Task ID:* \`#${newTask.id}\`
 ⏰ *Alert Time:* \`${newTask.reminder_time}\` (${time12})
@@ -457,6 +460,8 @@ bot.command('done', async (ctx) => {
       return ctx.replyWithMarkdown(`❌ Task \`#${taskId}\` was not found in your task list.`);
     }
 
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
+
     const recurringNotice = updated.is_recurring ? ' (Repeats again tomorrow! 🔄)' : '';
     return ctx.replyWithMarkdown(`🎉 *Task #${taskId} Marked as Completed!* ("${updated.task_name}")${recurringNotice}`);
   } catch (error) {
@@ -480,6 +485,8 @@ bot.command('delete', async (ctx) => {
       return ctx.replyWithMarkdown(`❌ Task \`#${taskId}\` was not found in your task list.`);
     }
 
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
+
     return ctx.replyWithMarkdown(`🗑️ *Task #${taskId} Deleted Successfully!* (${deleted.task_name})`);
   } catch (error) {
     console.error('Error deleting task:', error);
@@ -494,6 +501,7 @@ bot.action(/^done:(\d+)$/, async (ctx) => {
   try {
     const updated = await markTaskAsCompleted(taskId, ctx.chat.id);
     await ctx.answerCbQuery('Task completed! Great job! 🎉');
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
 
     if (updated) {
       const footerNote = updated.is_recurring
@@ -531,6 +539,7 @@ bot.action(/^snooze:(\d+):(\d+)$/, async (ctx) => {
     const updated = await snoozeTask(taskId, ctx.chat.id, newTime);
 
     await ctx.answerCbQuery(`Task snoozed for ${minutes} minutes! ⏰`);
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
 
     if (updated) {
       const time12 = formatTo12Hour(newTime);
@@ -614,6 +623,7 @@ bot.command('addschedule', async (ctx) => {
   try {
     const newClass = await createSchedule(ctx.chat.id, validDay, validTime, subject, room);
     const time12 = formatTo12Hour(newClass.time);
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
 
     return ctx.replyWithMarkdown(
       `✅ *Class Added to Weekly Schedule!*
@@ -733,6 +743,8 @@ bot.command('deleteschedule', async (ctx) => {
       return ctx.replyWithMarkdown(`❌ Class schedule \`#${scheduleId}\` was not found in your timetable.`);
     }
 
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
+
     return ctx.replyWithMarkdown(
       `🗑️ *Class Schedule #${scheduleId} Deleted!* ("${deleted.subject}" on ${deleted.day_of_week})`
     );
@@ -764,6 +776,8 @@ bot.command(['seedschedule', 'seed'], async (ctx) => {
     for (const item of csSchedule) {
       await createSchedule(ctx.chat.id, item.day_of_week, item.time, item.subject, item.room);
     }
+
+    refreshSchedulerCache().catch((err) => console.error('Cache sync error:', err));
 
     return ctx.replyWithMarkdown(
       `🎉 *Year 3 CS Semester 1 Schedule Loaded Successfully!* 📚\n\n` +
