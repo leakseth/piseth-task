@@ -15,6 +15,17 @@ import {
   deleteSchedule,
   snoozeTask,
   getUserStats,
+  createExpense,
+  getExpensesSummary,
+  getRecentExpenses,
+  deleteExpense,
+  createDeadline,
+  getActiveDeadlines,
+  deleteDeadline,
+  createNote,
+  getNotesByChatId,
+  searchNotes,
+  deleteNote,
   pool,
 } from './db.js';
 import {
@@ -32,6 +43,7 @@ import {
   processVoiceMessage,
   getActiveAiProvider,
 } from './translator.js';
+import { getPhnomPenhWeather } from './weather.js';
 
 // Force Node.js to use IPv4 first (prevents ECONNRESET on networks with broken/throttled IPv6)
 try {
@@ -233,6 +245,25 @@ I help you stay organized with reminder alerts, university class schedules, and 
 📊 *Productivity & Stats:*
 • \`/stats\` — View your task completion rates, habit streaks & study dashboard
 
+💰 *Expense & Budget Tracker:*
+• \`/spent <amount> <note>\` — Log expense (e.g. \`/spent 2.5$ coffee\` or \`/spent 5000r lunch\`)
+• \`/budget\` (or \`/expenses\`) — View today and monthly spending summary
+• \`/deleteexpense <id>\` — Delete an expense
+
+⏳ *Exam & Project Countdown:*
+• \`/deadline <YYYY-MM-DD> <Title>\` — Set exam/project deadline
+• \`/countdown\` — Count down days remaining until exams & projects
+• \`/deletedeadline <id>\` — Delete a deadline
+
+📝 *Notes & Code Snippets Vault:*
+• \`/note <Title> | <Content>\` — Save quick note or code snippet
+• \`/notes\` — View all saved notes
+• \`/findnote <keyword>\` — Search saved notes
+• \`/deletenote <id>\` — Delete a note
+
+🌤️ *Weather Forecast:*
+• \`/weather\` — Check real-time Phnom Penh weather & rain probability
+
 🎙️ *Voice Notes & Multimodal AI:*
 • Send any voice recording — Bot transcribes it, extracts tasks, and translates!
 
@@ -248,7 +279,8 @@ I help you stay organized with reminder alerts, university class schedules, and 
 ✨ *Automations:*
 • 🔔 Reminders with *[✅ Mark as Done]*, *[⏰ Snooze 10m]*, and *[⏰ Snooze 30m]* buttons.
 • 🔔 Smart *15-minute Pre-Class Alerts* before every class.
-• 🌅 Daily morning briefings & class schedule alerts at *07:00 AM*.`;
+• 🌅 Daily morning briefings with *Weather & Today's Schedule* at *07:00 AM*.
+• ⚠️ 1-day advance deadline warning alerts.`;
 
   return ctx.replyWithMarkdown(welcomeMessage);
 });
@@ -256,27 +288,30 @@ I help you stay organized with reminder alerts, university class schedules, and 
 // Command: /help
 bot.help((ctx) => {
   const helpMessage = 
-`📖 *Command Guide:*
+`📖 *Command Quick Guide:*
 
-📝 *Tasks:*
-• \`/add <time> <Task Name>\` — One-time task
-• \`/add <time> <Task Name> daily\` — Daily recurring task
-• \`/list\` — Display your active tasks
-• \`/done <id>\` — Mark task done
-• \`/delete <id>\` — Delete task
+📝 *Tasks & Reminders:*
+• \`/add <time> <Task Name> [daily]\`
+• \`/list\` • \`/done <id>\` • \`/delete <id>\` • \`/stats\`
 
-📚 *Weekly Timetable:*
-• \`/today\` — View today's class schedule instantly
-• \`/schedule\` — View full weekly timetable
-• \`/addschedule <DAY> <TIME> <Subject> | <Room>\`
-• \`/deleteschedule <id>\` — Delete a class
+📚 *University Schedule:*
+• \`/today\` • \`/schedule\` • \`/addschedule\` • \`/deleteschedule\`
 
-🌐 *Language & AI Assistant:*
-• \`/translate <text>\` — Translate Khmer ↔️ English or check English grammar
-  _(Supports inline buttons for instant translation & grammar check!)_
+💰 *Expense Tracker:*
+• \`/spent 2.5$ lunch\` • \`/budget\` • \`/deleteexpense <id>\`
 
-🕒 *System:*
-• \`/time\` — Check server clock and active timezone`;
+⏳ *Deadlines & Countdown:*
+• \`/deadline 2026-12-15 Final Exam\` • \`/countdown\`
+
+📝 *Notes Vault:*
+• \`/note Title | Content\` • \`/notes\` • \`/findnote keyword\`
+
+🌤️ *Weather:*
+• \`/weather\`
+
+🌐 *AI Assistant:*
+• \`/translate <text>\`
+• Send any voice recording for instant transcription & task creation!`;
 
   return ctx.replyWithMarkdown(helpMessage);
 });
@@ -1178,6 +1213,449 @@ bot.action(/^vtask:(.+)$/, async (ctx) => {
 });
 
 // -------------------------------------------------------------
+// Feature 1: Expense & Budget Tracker Commands
+// -------------------------------------------------------------
+
+// Helper to parse amount, currency, and category from text
+function parseExpenseInput(rawText) {
+  if (!rawText) return null;
+  const clean = rawText.trim();
+
+  // Regex matches: "$2.50 lunch", "2.5$ coffee", "5000r breakfast", "5000៛ gas", "10 USD books", "2.5 lunch"
+  const regex = /^(\$?\s*[\d]+(?:\.[\d]{1,2})?\s*(?:usd|\$|r|៛)?)\s+(.+)$/i;
+  const match = clean.match(regex);
+  if (!match) return null;
+
+  const rawAmountStr = match[1].toLowerCase().replace(/\s+/g, '');
+  const note = match[2].trim();
+
+  let currency = 'USD';
+  let amount = 0;
+
+  if (rawAmountStr.includes('r') || rawAmountStr.includes('៛')) {
+    currency = 'KHR';
+    amount = parseFloat(rawAmountStr.replace(/[r៛]/g, ''));
+  } else {
+    currency = 'USD';
+    amount = parseFloat(rawAmountStr.replace(/[\$usd]/g, ''));
+  }
+
+  if (isNaN(amount) || amount <= 0) return null;
+
+  // Conversion: 1 USD ≈ 4000 KHR
+  const amountUsd = currency === 'KHR' ? parseFloat((amount / 4000).toFixed(2)) : amount;
+
+  // Auto-categorize based on note keywords
+  const lowerNote = note.toLowerCase();
+  let category = 'General';
+  if (/បាយ|ម្ហូប|rice|food|lunch|dinner|breakfast|pizza|soup|burger|bread|eat/i.test(lowerNote)) {
+    category = 'Food & Dining';
+  } else if (/កាហ្វេ|coffee|tea|boba|drink|water|starbucks|amazon/i.test(lowerNote)) {
+    category = 'Coffee & Drinks';
+  } else if (/សាំង|gas|fuel|grab|passapp|parking|taxi|moto|bus/i.test(lowerNote)) {
+    category = 'Transportation';
+  } else if (/សៀវភៅ|book|pen|paper|print|copy|school|course|tuition|exam/i.test(lowerNote)) {
+    category = 'Education & Study';
+  } else if (/wifi|phone|card|bill|electric|water|rent/i.test(lowerNote)) {
+    category = 'Bills & Utilities';
+  }
+
+  return { amount, currency, amountUsd, category, note };
+}
+
+// Command: /spent <amount> <note> (or /expense)
+const handleAddExpense = async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/(spent|expense)(@\w+)?\s*/i, '').trim();
+
+  if (!payload) {
+    return ctx.replyWithHTML(
+      '⚠️ <b>Format:</b> <code>/spent &lt;amount&gt; &lt;note&gt;</code>\n\n' +
+      '<i>Examples:</i>\n' +
+      '• <code>/spent 2.5$ បាយថ្ងៃត្រង់</code>\n' +
+      '• <code>/spent 5000r កាហ្វេ Amazon</code>\n' +
+      '• <code>/spent 10$ ចាក់សាំងម៉ូតូ</code>'
+    );
+  }
+
+  const parsed = parseExpenseInput(payload);
+  if (!parsed) {
+    return ctx.replyWithHTML(
+      '⚠️ <b>Invalid format!</b> Please provide the amount followed by what you spent it on.\n' +
+      '<i>Example:</i> <code>/spent 3.5$ Coffee & Bread</code> or <code>/spent 6000r បាយព្រឹក</code>'
+    );
+  }
+
+  try {
+    const expense = await createExpense(
+      ctx.chat.id,
+      parsed.amount,
+      parsed.currency,
+      parsed.amountUsd,
+      parsed.category,
+      parsed.note
+    );
+
+    const currSign = parsed.currency === 'KHR' ? '៛' : '$';
+    const displayAmount = parsed.currency === 'KHR' ? `${parsed.amount.toLocaleString()} ៛` : `$${parsed.amount.toFixed(2)}`;
+
+    const message = 
+`💸 <b>EXPENSE RECORDED!</b>
+
+💵 <b>Amount:</b> <b>${displayAmount}</b> <i>(≈ $${parsed.amountUsd.toFixed(2)})</i>
+🏷️ <b>Category:</b> <code>${expense.category}</code>
+📝 <b>Note:</b> ${escapeHtml(expense.note)}
+🆔 <b>Expense ID:</b> <code>#${expense.id}</code>
+
+<i>View your spending report with:</i> /budget`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error logging expense:', err);
+    return ctx.reply('❌ Could not save expense. Please try again.');
+  }
+};
+
+bot.command('spent', handleAddExpense);
+bot.command('expense', handleAddExpense);
+
+// Command: /budget or /expenses (View spending breakdown)
+const handleViewBudget = async (ctx) => {
+  try {
+    const [summary, recents] = await Promise.all([
+      getExpensesSummary(ctx.chat.id),
+      getRecentExpenses(ctx.chat.id, 5),
+    ]);
+
+    const categoryLines = summary.categories.length > 0
+      ? summary.categories.map((c) => `  • ${c.category}: <b>$${c.total_usd.toFixed(2)}</b> <i>(${c.count}x)</i>`).join('\n')
+      : '  <i>No expenses recorded yet this month.</i>';
+
+    const recentLines = recents.length > 0
+      ? recents.map((r, i) => {
+          const sign = r.currency === 'KHR' ? `${Number(r.amount).toLocaleString()} ៛` : `$${Number(r.amount).toFixed(2)}`;
+          return `${i + 1}. <b>${sign}</b> — ${escapeHtml(r.note)} <i>[#${r.id}]</i>`;
+        }).join('\n')
+      : '  <i>No recent transactions.</i>';
+
+    const budgetMessage = 
+`💰 <b>Your Personal Expense & Budget Report</b>
+
+📅 <b>Overview:</b>
+• <b>Today:</b> <b>$${summary.today_spent_usd.toFixed(2)}</b> <i>(${summary.today_count} item${summary.today_count === 1 ? '' : 's'})</i>
+• <b>This Month:</b> <b>$${summary.month_spent_usd.toFixed(2)}</b> <i>(${summary.month_count} items)</i>
+
+📊 <b>Top Categories (This Month):</b>
+${categoryLines}
+
+🕒 <b>Recent Spending:</b>
+${recentLines}
+
+<i>Commands:</i> <code>/spent &lt;amount&gt; &lt;note&gt;</code> • <code>/deleteexpense &lt;id&gt;</code>`;
+
+    return ctx.replyWithHTML(budgetMessage);
+  } catch (err) {
+    console.error('Error fetching budget:', err);
+    return ctx.reply('❌ Could not retrieve budget summary. Please try again.');
+  }
+};
+
+bot.command('budget', handleViewBudget);
+bot.command('expenses', handleViewBudget);
+
+// Command: /deleteexpense <id>
+bot.command('deleteexpense', async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/deleteexpense(@\w+)?\s*/i, '').trim();
+  const expenseId = parseInt(payload, 10);
+
+  if (isNaN(expenseId)) {
+    return ctx.reply('⚠️ Please provide a valid expense ID: `/deleteexpense 1`', { parse_mode: 'Markdown' });
+  }
+
+  try {
+    const deleted = await deleteExpense(expenseId, ctx.chat.id);
+    if (!deleted) {
+      return ctx.reply(`❌ Expense #${expenseId} was not found.`);
+    }
+    return ctx.replyWithHTML(`🗑️ <b>Expense #${expenseId} deleted!</b> (${escapeHtml(deleted.note)})`);
+  } catch (err) {
+    console.error('Error deleting expense:', err);
+    return ctx.reply('❌ Could not delete expense.');
+  }
+});
+
+// -------------------------------------------------------------
+// Feature 3: Exam & Project Deadlines Countdown Commands
+// -------------------------------------------------------------
+
+// Command: /deadline <YYYY-MM-DD> <Title>
+bot.command('deadline', async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/deadline(@\w+)?\s*/i, '').trim();
+
+  // Format: 2026-12-15 Final Project
+  const match = payload.match(/^(\d{4}-\d{2}-\d{2})\s+(.+)$/s);
+  if (!match) {
+    return ctx.replyWithHTML(
+      '⚠️ <b>Format:</b> <code>/deadline &lt;YYYY-MM-DD&gt; &lt;Title&gt;</code>\n\n' +
+      '<i>Examples:</i>\n' +
+      '• <code>/deadline 2026-12-15 Final Project Submission</code>\n' +
+      '• <code>/deadline 2026-12-25 ប្រឡងបញ្ចប់ឆមាស (Final Exam)</code>'
+    );
+  }
+
+  const dateStr = match[1];
+  const title = match[2].trim();
+
+  const parsedDate = new Date(dateStr);
+  if (isNaN(parsedDate.getTime())) {
+    return ctx.reply('⚠️ Invalid date format. Please use YYYY-MM-DD (e.g. 2026-12-15).');
+  }
+
+  try {
+    const deadline = await createDeadline(ctx.chat.id, title, dateStr);
+    const active = await getActiveDeadlines(ctx.chat.id);
+    const found = active.find((d) => d.id === deadline.id);
+    const daysLeft = found ? Math.ceil(found.days_remaining) : 0;
+
+    const message = 
+`⏳ <b>DEADLINE SCHEDULED!</b>
+
+🎯 <b>Title:</b> <b>${escapeHtml(deadline.title)}</b>
+📅 <b>Target Date:</b> <code>${dateStr}</code>
+⏳ <b>Countdown:</b> <b>${daysLeft} day(s) remaining!</b>
+🆔 <b>Deadline ID:</b> <code>#${deadline.id}</code>
+
+<i>We will alert you 1 day before the deadline in your morning briefing!</i>
+<i>View all deadlines with:</i> /countdown`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error scheduling deadline:', err);
+    return ctx.reply('❌ Could not save deadline. Please try again.');
+  }
+});
+
+// Command: /countdown or /deadlines (View all upcoming deadlines)
+const handleViewDeadlines = async (ctx) => {
+  try {
+    const deadlines = await getActiveDeadlines(ctx.chat.id);
+
+    if (deadlines.length === 0) {
+      return ctx.replyWithHTML(
+        '⏳ <b>No Upcoming Deadlines or Exams!</b>\n\n' +
+        'Add a target date with:\n<code>/deadline 2026-12-15 Final Project Submission</code>'
+      );
+    }
+
+    const listText = deadlines.map((d, i) => {
+      const days = Math.ceil(d.days_remaining);
+      const badge = days === 0 ? '🚨 [DUE TODAY]' : days === 1 ? '⚠️ [TOMORROW]' : `⏳ [${days} days left]`;
+      const dateText = d.deadline_date instanceof Date ? d.deadline_date.toISOString().split('T')[0] : String(d.deadline_date);
+      return `${i + 1}. <b>${badge}</b> <b>${escapeHtml(d.title)}</b>\n   📅 Date: <code>${dateText}</code> <i>[#${d.id}]</i>`;
+    }).join('\n\n');
+
+    const message = 
+`⏳ <b>Your Upcoming Deadlines & Exam Countdown:</b>
+
+${listText}
+
+<i>Manage:</i> <code>/deadline &lt;YYYY-MM-DD&gt; &lt;Title&gt;</code> • <code>/deletedeadline &lt;id&gt;</code>`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error fetching countdown:', err);
+    return ctx.reply('❌ Could not retrieve deadlines.');
+  }
+};
+
+bot.command('countdown', handleViewDeadlines);
+bot.command('deadlines', handleViewDeadlines);
+
+// Command: /deletedeadline <id>
+bot.command('deletedeadline', async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/deletedeadline(@\w+)?\s*/i, '').trim();
+  const deadlineId = parseInt(payload, 10);
+
+  if (isNaN(deadlineId)) {
+    return ctx.reply('⚠️ Please provide a valid deadline ID number: `/deletedeadline 1`', { parse_mode: 'Markdown' });
+  }
+
+  try {
+    const deleted = await deleteDeadline(deadlineId, ctx.chat.id);
+    if (!deleted) {
+      return ctx.reply(`❌ Deadline #${deadlineId} was not found.`);
+    }
+    return ctx.replyWithHTML(`🗑️ <b>Deadline #${deadlineId} deleted!</b> (${escapeHtml(deleted.title)})`);
+  } catch (err) {
+    console.error('Error deleting deadline:', err);
+    return ctx.reply('❌ Could not delete deadline.');
+  }
+});
+
+// -------------------------------------------------------------
+// Feature 4: Quick Notes & Code Snippets Vault Commands
+// -------------------------------------------------------------
+
+// Command: /note <title> | <content>
+bot.command('note', async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/note(@\w+)?\s*/i, '').trim();
+
+  if (!payload || !payload.includes('|')) {
+    return ctx.replyWithHTML(
+      '⚠️ <b>Format:</b> <code>/note &lt;Title&gt; | &lt;Content&gt;</code>\n\n' +
+      '<i>Examples:</i>\n' +
+      '• <code>/note Git Reset | git reset --hard HEAD~1</code>\n' +
+      '• <code>/note Wi-Fi RUPP | Password: CS_Network_2026</code>\n' +
+      '• <code>/note Useful Link | https://github.com/my-repo</code>'
+    );
+  }
+
+  const parts = payload.split('|');
+  const title = parts[0].trim();
+  const content = parts.slice(1).join('|').trim();
+
+  if (!title || !content) {
+    return ctx.reply('⚠️ Please provide both a title and content separated by |.');
+  }
+
+  try {
+    const note = await createNote(ctx.chat.id, title, content);
+
+    const message = 
+`📝 <b>NOTE SAVED IN VAULT!</b>
+
+📌 <b>Title:</b> <b>${escapeHtml(note.title)}</b>
+📄 <b>Content:</b>
+<code>${escapeHtml(note.content)}</code>
+🆔 <b>Note ID:</b> <code>#${note.id}</code>
+
+<i>View all notes: /notes | Search notes: /findnote &lt;keyword&gt;</i>`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error saving note:', err);
+    return ctx.reply('❌ Could not save note. Please try again.');
+  }
+});
+
+// Command: /notes (View all saved notes)
+bot.command('notes', async (ctx) => {
+  try {
+    const notes = await getNotesByChatId(ctx.chat.id, 15);
+
+    if (notes.length === 0) {
+      return ctx.replyWithHTML(
+        '📝 <b>Your Note Vault is Empty!</b>\n\n' +
+        'Save a note with:\n<code>/note Git | git checkout -b feature-branch</code>'
+      );
+    }
+
+    const listText = notes.map((n, i) => {
+      const preview = n.content.length > 60 ? `${n.content.slice(0, 60)}...` : n.content;
+      return `${i + 1}. 📌 <b>${escapeHtml(n.title)}</b> <i>[#${n.id}]</i>\n   <code>${escapeHtml(preview)}</code>`;
+    }).join('\n\n');
+
+    const message = 
+`📝 <b>Your Saved Notes & Snippets (${notes.length}):</b>
+
+${listText}
+
+<i>Manage:</i> <code>/note &lt;Title&gt; | &lt;Content&gt;</code> • <code>/findnote &lt;keyword&gt;</code> • <code>/deletenote &lt;id&gt;</code>`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error fetching notes:', err);
+    return ctx.reply('❌ Could not retrieve notes.');
+  }
+});
+
+// Command: /findnote <keyword> or /searchnote
+const handleSearchNote = async (ctx) => {
+  const keyword = ctx.message.text.replace(/^\/(findnote|searchnote)(@\w+)?\s*/i, '').trim();
+
+  if (!keyword) {
+    return ctx.reply('⚠️ Please provide a keyword: `/findnote Git`', { parse_mode: 'Markdown' });
+  }
+
+  try {
+    const results = await searchNotes(ctx.chat.id, keyword);
+
+    if (results.length === 0) {
+      return ctx.replyWithHTML(`🔍 No notes found matching <code>${escapeHtml(keyword)}</code>.`);
+    }
+
+    const listText = results.map((n, i) => {
+      return `${i + 1}. 📌 <b>${escapeHtml(n.title)}</b> <i>[#${n.id}]</i>\n<code>${escapeHtml(n.content)}</code>`;
+    }).join('\n\n');
+
+    const message = 
+`🔍 <b>Search Results for "${escapeHtml(keyword)}" (${results.length} found):</b>
+
+${listText}`;
+
+    return ctx.replyWithHTML(message);
+  } catch (err) {
+    console.error('Error searching notes:', err);
+    return ctx.reply('❌ Search failed. Please try again.');
+  }
+};
+
+bot.command('findnote', handleSearchNote);
+bot.command('searchnote', handleSearchNote);
+
+// Command: /deletenote <id>
+bot.command('deletenote', async (ctx) => {
+  const payload = ctx.message.text.replace(/^\/deletenote(@\w+)?\s*/i, '').trim();
+  const noteId = parseInt(payload, 10);
+
+  if (isNaN(noteId)) {
+    return ctx.reply('⚠️ Please provide a valid note ID: `/deletenote 1`', { parse_mode: 'Markdown' });
+  }
+
+  try {
+    const deleted = await deleteNote(noteId, ctx.chat.id);
+    if (!deleted) {
+      return ctx.reply(`❌ Note #${noteId} was not found.`);
+    }
+    return ctx.replyWithHTML(`🗑️ <b>Note #${noteId} deleted!</b> (${escapeHtml(deleted.title)})`);
+  } catch (err) {
+    console.error('Error deleting note:', err);
+    return ctx.reply('❌ Could not delete note.');
+  }
+});
+
+// -------------------------------------------------------------
+// Feature 5: Weather Forecast Command
+// -------------------------------------------------------------
+
+// Command: /weather (Check Phnom Penh real-time weather)
+bot.command('weather', async (ctx) => {
+  try {
+    const weather = await getPhnomPenhWeather();
+
+    if (!weather.success) {
+      return ctx.reply('🌤️ Phnom Penh Weather: ~30°C. Have a great day!');
+    }
+
+    const weatherMessage = 
+`🌤️ <b>Weather Forecast — ${weather.city}</b>
+
+🌡️ <b>Temperature:</b> <b>${weather.tempCurrent}°C</b> <i>(Feels like ${weather.tempFeelsLike}°C)</i>
+📈 <b>Max / Min:</b> ${weather.tempMax}°C / ${weather.tempMin}°C
+🌧️ <b>Precipitation Probability:</b> <b>${weather.rainProb}%</b>
+💧 <b>Humidity:</b> ${weather.humidity}%
+💨 <b>Wind Speed:</b> ${weather.windSpeed} km/h
+${weather.emoji} <b>Condition:</b> <b>${weather.condition}</b>
+
+<i>Stay hydrated and have a great, safe day!</i> ☀️`;
+
+    return ctx.replyWithHTML(weatherMessage);
+  } catch (err) {
+    console.error('Error checking weather:', err);
+    return ctx.reply('❌ Could not fetch weather at the moment.');
+  }
+});
+
+// -------------------------------------------------------------
 // Application Lifecycle & Schedulers
 // -------------------------------------------------------------
 
@@ -1193,6 +1671,13 @@ async function launchBotWithRetry(targetBot) {
       { command: 'today', description: 'មើលកាលវិភាគថ្ងៃនេះ (Today classes)' },
       { command: 'schedule', description: 'មើលកាលវិភាគសប្ដាហ៍ (Weekly Timetable)' },
       { command: 'stats', description: 'មើលស្ថិតិការងារ & ការសិក្សា (Productivity stats)' },
+      { command: 'spent', description: 'កត់ត្រាការចំណាយ (ឧ. /spent 2.5$ coffee)' },
+      { command: 'budget', description: 'មើលសង្ខេបចំណាយ (Daily/Monthly budget)' },
+      { command: 'deadline', description: 'កំណត់ថ្ងៃ Deadline (ឧ. /deadline 2026-12-15...)' },
+      { command: 'countdown', description: 'រាប់ថយក្រោយថ្ងៃប្រឡង & Project (Deadlines)' },
+      { command: 'note', description: 'កត់ត្រាចំណាំ (ឧ. /note Git | git reset...)' },
+      { command: 'notes', description: 'មើលកំណត់ត្រាចំណាំទាំងអស់ (Notes vault)' },
+      { command: 'weather', description: 'ពិនិត្យអាកាសធាតុភ្នំពេញ (Weather forecast)' },
       { command: 'translate', description: 'បកប្រែ & កែវេយ្យាករណ៍ (Translate & Grammar)' },
       { command: 'add', description: 'បន្ថែម Task ថ្មី (ឧ. /add 19:30 រៀនកូដ daily)' },
       { command: 'list', description: 'មើលបញ្ជី Task ទាំងអស់' },

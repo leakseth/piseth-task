@@ -7,7 +7,9 @@ import {
   resetRecurringTasksForNewDay,
   getAllTodaySchedulesGroupedByChat,
   getClassesByDayAndTime,
+  getUpcomingDeadlinesAcrossUsers,
 } from './db.js';
+import { getPhnomPenhWeather } from './weather.js';
 
 // Resolve timezone from .env or default to Asia/Phnom_Penh
 export const TIMEZONE = process.env.TIMEZONE || 'Asia/Phnom_Penh';
@@ -230,9 +232,12 @@ ${recurringFooter}`;
   const briefingJob = cron.schedule(
     '0 7 * * *',
     async () => {
-      console.log(`[07:00 AM] 🌅 Running Daily Morning Briefing & Schedule alerts in timezone: "${TIMEZONE}"...`);
+      console.log(`[07:00 AM] 🌅 Running Daily Morning Briefing, Weather & Schedule alerts in timezone: "${TIMEZONE}"...`);
 
-      // Part A: Daily Tasks Briefing
+      // Fetch Phnom Penh weather forecast
+      const weather = await getPhnomPenhWeather();
+
+      // Part A: Daily Tasks Briefing with Weather
       try {
         const groupedTasks = await getAllPendingTasksGroupedByChat();
         const chatIds = Object.keys(groupedTasks);
@@ -249,7 +254,10 @@ ${recurringFooter}`;
           const briefingMessage = 
 `🌅 <b>Good Morning! Here is your Daily Task Briefing:</b>
 
-You have <b>${userTasks.length}</b> task(s) on your agenda:
+🌤️ <b>Today's Weather (${weather.city}):</b>
+${weather.summaryText}
+
+📋 You have <b>${userTasks.length}</b> task(s) on your agenda:
 ${taskListText}
 
 <i>Stay focused and have a great, productive day!</i> 🚀`;
@@ -310,6 +318,35 @@ ${classListText}
         }
       } catch (err) {
         console.error('❌ Error executing morning class schedule alert:', err.message);
+      }
+
+      // Part C: 1-Day Before Deadline Alerts
+      try {
+        const tomorrowDeadlines = await getUpcomingDeadlinesAcrossUsers(1);
+        if (tomorrowDeadlines.length > 0) {
+          for (const d of tomorrowDeadlines) {
+            const deadlineNotice = 
+`⚠️ <b>DEADLINE REMINDER: Due Tomorrow!</b> ⏳
+
+🎯 <b>Title:</b> <b>${d.title}</b>
+📅 <b>Deadline Date:</b> <code>${d.deadline_date instanceof Date ? d.deadline_date.toISOString().split('T')[0] : d.deadline_date}</code>
+
+<i>Make sure your final submissions, exam reviews, or project deliverables are complete! You got this! 🔥</i>`;
+
+            try {
+              await sendWithRetry(async () => {
+                return await bot.telegram.sendMessage(d.chat_id, deadlineNotice, {
+                  parse_mode: 'HTML',
+                });
+              });
+              console.log(`✅ Sent 1-day deadline alert for "${d.title}" to Chat ID: ${d.chat_id}`);
+            } catch (dErr) {
+              console.error(`❌ Failed to send deadline alert to ${d.chat_id}:`, dErr.message);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('❌ Error executing morning deadline alerts:', err.message);
       }
     },
     {

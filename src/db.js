@@ -74,6 +74,44 @@ export async function initDb() {
 
     CREATE INDEX IF NOT EXISTS idx_schedules_chat_day ON schedules(chat_id, day_of_week);
     CREATE INDEX IF NOT EXISTS idx_schedules_day ON schedules(day_of_week);
+
+    -- 3. Expenses & Budget Tracker Table
+    CREATE TABLE IF NOT EXISTS expenses (
+      id SERIAL PRIMARY KEY,
+      chat_id BIGINT NOT NULL,
+      amount NUMERIC(12, 2) NOT NULL,
+      currency VARCHAR(5) NOT NULL DEFAULT 'USD',
+      amount_usd NUMERIC(12, 2) NOT NULL,
+      category VARCHAR(50) NOT NULL DEFAULT 'General',
+      note TEXT NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_expenses_chat_created ON expenses(chat_id, created_at);
+
+    -- 4. Exam & Project Deadlines Countdown Table
+    CREATE TABLE IF NOT EXISTS deadlines (
+      id SERIAL PRIMARY KEY,
+      chat_id BIGINT NOT NULL,
+      title TEXT NOT NULL,
+      deadline_date DATE NOT NULL,
+      is_notified BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_deadlines_chat_date ON deadlines(chat_id, deadline_date);
+    CREATE INDEX IF NOT EXISTS idx_deadlines_alert ON deadlines(deadline_date, is_notified);
+
+    -- 5. Quick Notes & Code Snippets Vault Table
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      chat_id BIGINT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_notes_chat_id ON notes(chat_id);
   `;
 
   try {
@@ -347,4 +385,187 @@ export async function getUserStats(chatId) {
     completed_last_7_days: parseInt(t.completed_last_7_days || '0', 10),
     total_classes: parseInt(scheduleRes.rows[0]?.total_classes || '0', 10),
   };
+}
+
+// -------------------------------------------------------------
+// Expenses & Budget Tracker Database Operations
+// -------------------------------------------------------------
+
+// 1. Log a new expense
+export async function createExpense(chatId, amount, currency, amountUsd, category, note) {
+  const query = `
+    INSERT INTO expenses (chat_id, amount, currency, amount_usd, category, note)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    RETURNING id, chat_id, amount, currency, amount_usd, category, note, created_at;
+  `;
+  const values = [chatId, amount, currency, amountUsd, category, note];
+  const { rows } = await pool.query(query, values);
+  return rows[0];
+}
+
+// 2. Fetch financial summary (Today, This Month, and Category breakdown)
+export async function getExpensesSummary(chatId) {
+  const query = `
+    SELECT 
+      COALESCE(SUM(amount_usd) FILTER (WHERE created_at >= CURRENT_DATE), 0) AS today_spent_usd,
+      COALESCE(SUM(amount_usd) FILTER (WHERE created_at >= DATE_TRUNC('month', CURRENT_DATE)), 0) AS month_spent_usd,
+      COUNT(*) FILTER (WHERE created_at >= CURRENT_DATE) AS today_count,
+      COUNT(*) FILTER (WHERE created_at >= DATE_TRUNC('month', CURRENT_DATE)) AS month_count
+    FROM expenses
+    WHERE chat_id = $1;
+  `;
+
+  const categoryQuery = `
+    SELECT category, COALESCE(SUM(amount_usd), 0) AS total_usd, COUNT(*) AS count
+    FROM expenses
+    WHERE chat_id = $1 AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY category
+    ORDER BY total_usd DESC
+    LIMIT 5;
+  `;
+
+  const [summaryRes, categoryRes] = await Promise.all([
+    pool.query(query, [chatId]),
+    pool.query(categoryQuery, [chatId]),
+  ]);
+
+  const s = summaryRes.rows[0] || {};
+  return {
+    today_spent_usd: parseFloat(s.today_spent_usd || 0),
+    month_spent_usd: parseFloat(s.month_spent_usd || 0),
+    today_count: parseInt(s.today_count || 0, 10),
+    month_count: parseInt(s.month_count || 0, 10),
+    categories: categoryRes.rows.map((r) => ({
+      category: r.category,
+      total_usd: parseFloat(r.total_usd),
+      count: parseInt(r.count, 10),
+    })),
+  };
+}
+
+// 3. Get recent expenses list
+export async function getRecentExpenses(chatId, limit = 8) {
+  const query = `
+    SELECT id, amount, currency, amount_usd, category, note, created_at
+    FROM expenses
+    WHERE chat_id = $1
+    ORDER BY created_at DESC, id DESC
+    LIMIT $2;
+  `;
+  const { rows } = await pool.query(query, [chatId, limit]);
+  return rows;
+}
+
+// 4. Delete an expense by ID
+export async function deleteExpense(expenseId, chatId) {
+  const query = `
+    DELETE FROM expenses
+    WHERE id = $1 AND chat_id = $2
+    RETURNING id, amount, currency, note;
+  `;
+  const { rows } = await pool.query(query, [expenseId, chatId]);
+  return rows[0];
+}
+
+// -------------------------------------------------------------
+// Exam & Project Deadlines Countdown Database Operations
+// -------------------------------------------------------------
+
+// 1. Create a new deadline
+export async function createDeadline(chatId, title, deadlineDate) {
+  const query = `
+    INSERT INTO deadlines (chat_id, title, deadline_date)
+    VALUES ($1, $2, $3)
+    RETURNING id, chat_id, title, deadline_date, created_at;
+  `;
+  const { rows } = await pool.query(query, [chatId, title, deadlineDate]);
+  return rows[0];
+}
+
+// 2. Fetch all upcoming deadlines for a user, sorted nearest to furthest
+export async function getActiveDeadlines(chatId) {
+  const query = `
+    SELECT 
+      id, chat_id, title, deadline_date,
+      (deadline_date - CURRENT_DATE) AS days_remaining
+    FROM deadlines
+    WHERE chat_id = $1 AND deadline_date >= CURRENT_DATE
+    ORDER BY deadline_date ASC, id ASC;
+  `;
+  const { rows } = await pool.query(query, [chatId]);
+  return rows;
+}
+
+// 3. Fetch deadlines due in exactly N days across all users (e.g. 1 day notice)
+export async function getUpcomingDeadlinesAcrossUsers(daysNotice = 1) {
+  const query = `
+    SELECT id, chat_id, title, deadline_date
+    FROM deadlines
+    WHERE (deadline_date - CURRENT_DATE) = $1;
+  `;
+  const { rows } = await pool.query(query, [daysNotice]);
+  return rows;
+}
+
+// 4. Delete a deadline by ID
+export async function deleteDeadline(deadlineId, chatId) {
+  const query = `
+    DELETE FROM deadlines
+    WHERE id = $1 AND chat_id = $2
+    RETURNING id, title, deadline_date;
+  `;
+  const { rows } = await pool.query(query, [deadlineId, chatId]);
+  return rows[0];
+}
+
+// -------------------------------------------------------------
+// Quick Notes & Code Snippets Vault Database Operations
+// -------------------------------------------------------------
+
+// 1. Create a new note
+export async function createNote(chatId, title, content) {
+  const query = `
+    INSERT INTO notes (chat_id, title, content)
+    VALUES ($1, $2, $3)
+    RETURNING id, chat_id, title, content, created_at;
+  `;
+  const { rows } = await pool.query(query, [chatId, title, content]);
+  return rows[0];
+}
+
+// 2. Fetch all notes for a user
+export async function getNotesByChatId(chatId, limit = 20) {
+  const query = `
+    SELECT id, title, content, created_at
+    FROM notes
+    WHERE chat_id = $1
+    ORDER BY created_at DESC, id DESC
+    LIMIT $2;
+  `;
+  const { rows } = await pool.query(query, [chatId, limit]);
+  return rows;
+}
+
+// 3. Search notes by title or content keyword
+export async function searchNotes(chatId, keyword) {
+  const query = `
+    SELECT id, title, content, created_at
+    FROM notes
+    WHERE chat_id = $1 AND (title ILIKE $2 OR content ILIKE $2)
+    ORDER BY created_at DESC
+    LIMIT 10;
+  `;
+  const { rows } = await pool.query(query, [chatId, `%${keyword}%`]);
+  return rows;
+}
+
+// 4. Delete a note by ID
+export async function deleteNote(noteId, chatId) {
+  const query = `
+    DELETE FROM notes
+    WHERE id = $1 AND chat_id = $2
+    RETURNING id, title;
+  `;
+  const { rows } = await pool.query(query, [noteId, chatId]);
+  return rows[0];
 }
